@@ -4023,6 +4023,7 @@ async def download_media_token(token: str, request: Request):
 @app.api_route("/dl/{chat_id}/{message_id}", methods=["GET", "HEAD"])
 @app.api_route("/dl/{chat_id}/{message_id}/{filename}", methods=["GET", "HEAD"])
 async def stream_media(chat_id: str, message_id: int, request: Request, filename: str = None):
+    request_started = monotonic()
     try:
         chat_id = int(chat_id)
     except ValueError:
@@ -4147,14 +4148,30 @@ async def stream_media(chat_id: str, message_id: int, request: Request, filename
             cache_file = None
             cache_complete = False
             adaptive_engine = None
+            go_stream = None
             backend = "WZGram"
             reserved_clients = {client_id: client}
             transfer_id = None
             bytes_sent = 0
+            first_body_ms = None
             try:
                 stream_started = monotonic()
+                go_first = None
+                if environ.get("USE_GO_ENGINE", "true").strip().lower() in {"1", "true", "yes", "on"}:
+                    from bot.helper.ext_utils.go_bridge import recover_go_range, stream_range
 
-                if FILETOLINK_ADAPTIVE_STREAMING:
+                    if file_id := getattr(media, "file_id", None):
+                        go_stream = stream_range(client, file_id, file_size, start, end)
+                        go_first = await anext(go_stream, None)
+                        if go_first is not None:
+                            backend = "Go"
+
+                if go_first is None and getattr(client, "_amaterasu_go_flood_until", 0) > monotonic():
+                    from bot.helper.ext_utils.go_bridge import wait_go_cooldown
+
+                    await wait_go_cooldown(client)
+
+                if go_first is None and FILETOLINK_ADAPTIVE_STREAMING:
                     try:
                         from bot.helper.telegram_helper.tg_stream import (
                             AdaptiveTelegramStream,
@@ -4246,15 +4263,41 @@ async def stream_media(chat_id: str, message_id: int, request: Request, filename
                             cache_reservation = None
 
                 async def deliver(iterator):
-                    nonlocal bytes_sent
+                    nonlocal bytes_sent, first_body_ms
                     async for chunk in iterator:
                         if cache_file is not None:
                             await cache_file.write(chunk)
+                        if chunk and first_body_ms is None:
+                            first_body_ms = (monotonic() - request_started) * 1000
                         bytes_sent += len(chunk)
                         _update_filetolink_transfer(transfer_id, bytes_sent)
                         yield chunk
 
-                if adaptive_engine is not None:
+                if go_first is not None:
+                    async def resume(offset):
+                        from bot.helper.ext_utils.go_bridge import wait_go_cooldown
+
+                        await wait_go_cooldown(client)
+                        async for chunk in _iter_telegram_range(
+                            client_id, client, message, offset, end, file_size,
+                        ):
+                            yield chunk
+
+                    def go_failed(offset):
+                        nonlocal backend
+                        LOGGER.warning(
+                            "Go FileToLink range interrupted for %s; resuming through WZGram at byte %s",
+                            filename, offset,
+                        )
+                        backend = "Go/WZGram"
+                        if active := _filetolink_active_streams.get(transfer_id):
+                            active["source"] = "Telegram / Go/WZGram"
+
+                    async for chunk in deliver(
+                        recover_go_range(go_stream, go_first, start, end, resume, go_failed)
+                    ):
+                        yield chunk
+                elif adaptive_engine is not None:
                     try:
                         async for chunk in deliver(
                             adaptive_engine.iter_range(start, end)
@@ -4284,7 +4327,7 @@ async def stream_media(chat_id: str, message_id: int, request: Request, filename
                         if active_transfer is not None:
                             active_transfer["source"] = "Telegram"
 
-                if adaptive_engine is None:
+                if go_first is None and adaptive_engine is None:
                     async for chunk in deliver(
                         _iter_telegram_range(
                             client_id,
@@ -4302,7 +4345,7 @@ async def stream_media(chat_id: str, message_id: int, request: Request, filename
                         adaptive_engine.used_client_ids
                         - adaptive_engine.failed_client_ids
                         if adaptive_engine is not None
-                        else {client_id}
+                        else (set() if backend == "Go" else {client_id})
                     )
                     for successful_client_id in successful_clients:
                         _record_stream_success(successful_client_id)
@@ -4310,11 +4353,12 @@ async def stream_media(chat_id: str, message_id: int, request: Request, filename
                     elapsed = max(monotonic() - stream_started, 0.001)
                     LOGGER.info(
                         "FileToLink performance: name=%s client=%s backend=%s "
-                        "bytes=%s elapsed=%.2fs speed=%.2fMiB/s prefetch=%s active=%s",
+                        "bytes=%s first_body_ms=%.1f elapsed=%.2fs speed=%.2fMiB/s prefetch=%s active=%s",
                         filename,
                         client_id,
-                        backend if adaptive_engine is not None else "WZGram",
+                        backend if go_first is not None or adaptive_engine is not None else "WZGram",
                         bytes_sent,
+                        first_body_ms,
                         elapsed,
                         bytes_sent / elapsed / (1024 * 1024),
                         _transfer_prefetch_depth(client_id),
@@ -4323,12 +4367,12 @@ async def stream_media(chat_id: str, message_id: int, request: Request, filename
             except CancelledError:
                 raise
             except Exception as error:
-                if adaptive_engine is None:
+                if adaptive_engine is None and backend != "Go":
                     _record_stream_failure(
                         client_id,
                         f"stream interrupted: {error}",
                     )
-                elif not adaptive_engine.failed_client_ids:
+                elif adaptive_engine is not None and not adaptive_engine.failed_client_ids:
                     for failed_client_id in (
                         adaptive_engine.used_client_ids or {client_id}
                     ):
@@ -4345,6 +4389,9 @@ async def stream_media(chat_id: str, message_id: int, request: Request, filename
                 )
                 raise
             finally:
+                if go_stream is not None:
+                    with suppress(Exception):
+                        await go_stream.aclose()
                 if cache_file is not None:
                     with suppress(Exception):
                         await cache_file.close()

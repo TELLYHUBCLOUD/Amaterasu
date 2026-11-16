@@ -32,6 +32,7 @@ RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh \
 # Python's site-packages (by Dockerfile.base Block 7). Without this flag,
 # the venv is isolated and can't import 'mega.MegaApi' → Mega download/upload
 # fails with "Mega SDK Python bindings are not installed in this image".
+# The Rust extension from Dockerfile.base is inherited here as well.
 RUN python3 -m venv --system-site-packages /amaterasuvenv
 
 # Install uv into the venv for fast package installation

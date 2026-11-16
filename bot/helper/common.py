@@ -18,7 +18,6 @@ from pyrogram.types import Message
 from .. import (
     DOWNLOAD_DIR,
     LOGGER,
-    categories_dict,
     cores,
     excluded_extensions,
     intervals,
@@ -85,6 +84,7 @@ from .mirror_leech_utils.terabox_utils.list import TeraboxCookieSelector, Terabo
 from .telegram_helper.bot_commands import BotCommands
 from .telegram_helper.compat import get_user_mention
 from .telegram_helper.message_utils import (
+    get_drive_categories,
     get_tg_link_message,
     open_category_btns,
     open_leech_dump_btns,
@@ -172,7 +172,7 @@ class TaskConfig:
         self.name = ""
         self.subname = ""
         self.category = ""
-        self.index_link = ""
+        self.upload_index_url = None
         self.name_swap = ""
         self.autorename_template = ""
         self.thumbnail_layout = ""
@@ -611,7 +611,7 @@ class TaskConfig:
             chat_id = chat.id
         self.cmd_up_dest = format_leech_dump_destination((chat_id, topic_id))
 
-    async def before_start(self):
+    async def before_start(self, *, auto_drive_category=False):
         await self._prepare_leech_dumps()
         self.name_swap = (
             self.name_swap
@@ -693,6 +693,13 @@ class TaskConfig:
 
         self.transmission_mode = Config.TRANSMISSION_MODE
 
+        prompt_category = (
+            auto_drive_category
+            and not self.is_leech
+            and not self.up_dest
+            and not self.category
+            and fetch_drive_cat(self.user_id)
+        )
         if self.user_dict.get("UPLOAD_PATHS", False):
             if self.up_dest in self.user_dict["UPLOAD_PATHS"]:
                 self.up_dest = self.user_dict["UPLOAD_PATHS"][self.up_dest]
@@ -700,40 +707,40 @@ class TaskConfig:
             if self.up_dest in Config.UPLOAD_PATHS:
                 self.up_dest = Config.UPLOAD_PATHS[self.up_dest]
 
-        if self.category and not self.is_leech:
-            dcats = fetch_drive_cat(self.user_id)
+        gc_used = False
+        if not self.is_leech and (self.category or prompt_category):
             default_id = self.user_dict.get("GDRIVE_ID") or Config.GDRIVE_ID
             default_index = self.user_dict.get("INDEX_URL") or Config.INDEX_URL
-            merged_cats = {
-                "Default": {"drive_id": default_id, "index_link": default_index},
-                **dcats,
-                **categories_dict,
-            }
+            selected = (
+                get_drive_categories(self.user_id).get(self.category)
+                if self.category
+                else None
+            )
             if self.category == "gdl":
                 self.up_dest = "gdl"
             elif self.category == "gd":
                 self.up_dest = default_id
-                self.index_link = default_index
+                self.upload_index_url = default_index
+            elif selected:
+                self.up_dest = selected["drive_id"]
+                self.upload_index_url = selected.get("index_link", "")
             elif "|" in self.category:
                 parts = self.category.split("|", 1)
                 self.up_dest = parts[0]
-                self.index_link = parts[1] if len(parts) > 1 else ""
+                self.upload_index_url = parts[1]
             elif is_gdrive_id(self.category):
                 self.up_dest = self.category
-            elif self.category in merged_cats:
-                self.up_dest = merged_cats[self.category]["drive_id"]
-                self.index_link = merged_cats[self.category].get("index_link", "")
             else:
-                drive_id, index_link, is_cancelled = await open_category_btns(self.message)
+                drive_id, index_link, is_cancelled = await open_category_btns(
+                    self.message, use_default_on_timeout=auto_drive_category
+                )
                 if is_cancelled:
                     self.is_cancelled = True
                     return
                 if drive_id:
                     self.up_dest = drive_id
-                    self.index_link = index_link or ""
+                    self.upload_index_url = index_link or ""
             gc_used = True
-        else:
-            gc_used = False
 
         if self.ffmpeg_cmds and not isinstance(self.ffmpeg_cmds, list):
             if self.user_dict.get("FFMPEG_CMDS", None):

@@ -6,9 +6,11 @@
 .env.*
 !.env.example
 .venv
+rust-core/target
 __pycache__
 *.pyc
 .pytest_cache
+.pytest-cache
 .ruff_cache
 .coverage
 htmlcov

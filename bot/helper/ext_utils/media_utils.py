@@ -27,6 +27,7 @@ from PIL import Image
 from ... import DOWNLOAD_DIR, LOGGER, cores, threads
 from ...core.config_manager import BinConfig
 from .bot_utils import cmd_exec, sync_to_async
+from .rust_bridge import probe_document_type
 from .files_utils import get_mime_type, is_archive, is_archive_split
 from .status_utils import time_to_seconds
 
@@ -382,6 +383,12 @@ async def get_document_type(path):
     )
     if mime_type.startswith(non_media_mimes):
         return False, False, False
+    if mime_type in {
+        "video/mp4", "audio/mp4", "video/x-matroska", "audio/x-matroska",
+        "video/webm", "audio/webm",
+    }:
+        if (media_type := await sync_to_async(probe_document_type, path)) is not None:
+            return media_type
     try:
         result = await cmd_exec(
             [

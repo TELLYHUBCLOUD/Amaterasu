@@ -1,4 +1,4 @@
-from asyncio import Semaphore, sleep
+from asyncio import Semaphore, create_task, sleep
 from time import monotonic
 
 from PIL import Image
@@ -10,7 +10,7 @@ try:
 except ImportError:
     FloodPremiumWait = FloodWait
 
-from os import path as ospath
+from os import getenv, path as ospath
 
 from aiofiles.os import path as aiopath
 from aiofiles.os import remove
@@ -240,7 +240,24 @@ class HypertgUpload(HypertgTransfer):
                 return await self._send_with_retry(client.send_photo, **kwargs)
             return await self._send_with_retry(client.send_document, **kwargs)
 
-        uploaded_token = UPLOADED_FILES.set({})
+        uploaded = {}
+        if getenv("USE_GO_ENGINE", "true").strip().lower() in {"1", "true", "yes", "on"}:
+            from .go_bridge import upload_parts
+
+            filename = kwargs.get(key.rstrip("s"))
+            if filename and any(client is helper for helper in self.clients.values()):
+                async def report(current, total):
+                    await self._progress(current, total, filename)
+
+                transfer = create_task(upload_parts(client, filename, report))
+                self._tasks.append(transfer)
+                try:
+                    file = await transfer
+                finally:
+                    self._tasks.remove(transfer)
+                if file is not None:
+                    uploaded[filename] = file
+        uploaded_token = UPLOADED_FILES.set(uploaded)
         try:
             return await send()
         except PhotoInvalidDimensions:

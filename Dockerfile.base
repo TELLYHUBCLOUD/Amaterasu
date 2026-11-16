@@ -21,6 +21,23 @@
 #  Or native (faster, no QEMU):
 #    docker build -f Dockerfile.base -t amaterasu-base:latest .
 # =============================================================================
+FROM rust:1.96-bookworm AS rust-builder
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3-dev python3-venv \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3 -m venv /build/venv \
+    && /build/venv/bin/pip install --no-cache-dir "maturin>=1.9,<2"
+WORKDIR /build/rust-core
+COPY rust-core/ ./
+RUN /build/venv/bin/maturin build --locked --release --strip --out /dist
+
+FROM golang:1.26-bookworm AS go-builder
+WORKDIR /build/go-engine
+COPY go-engine/go.mod go-engine/go.sum ./
+RUN go mod download
+COPY go-engine/ ./
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /usr/local/bin/amaterasu-go ./cmd/amaterasu-go
+
 FROM --platform=$TARGETPLATFORM docker.io/library/python:3.11-slim-bookworm AS base
 
 ARG TARGETPLATFORM
@@ -534,6 +551,12 @@ RUN set -eux; \
     which java || echo "WARNING: java not found"; \
     which gunicorn || echo "WARNING: gunicorn not found"; \
     echo "=== ALL COMPONENTS VERIFIED ==="
+
+COPY --from=go-builder /usr/local/bin/amaterasu-go /usr/local/bin/amaterasu-go
+RUN --mount=from=rust-builder,source=/dist,target=/tmp/wheels \
+    python3 -m pip install --no-cache-dir /tmp/wheels/*.whl \
+    && python3 -c "import amaterasu_rs" \
+    && amaterasu-go --help
 
 WORKDIR /app
 

@@ -365,6 +365,20 @@ The `docker-compose.yml` is pre-configured with:
 - **Volume mount** (`.:/usr/src/app:z`) — your local `config.py`, `token.pickle`, etc. are live-synced into the container.
 - **Safe update default** (`AUTO_UPDATE=false`) — container startup does not modify the bind-mounted Git checkout. Compose passes `AUTO_UPDATE` through only when it is explicitly set, so an unset environment does not override `config.py` or the System & Automation setting saved in MongoDB. The entry in `.env.example` is intentionally commented; uncomment it only when an environment-level override is desired.
 
+For a local hybrid build, build the native base first, then build the bot from it:
+
+```bash
+docker build -f Dockerfile.base -t amaterasu-base:local .
+AMATERASU_BASE_IMAGE=amaterasu-base:local docker compose -f docker-compose.dev.yml build amaterasu
+```
+
+The Rust extension is inherited from the base image. Set `USE_RUST_CORE=false` to
+use the Python paths. The Go engine is enabled by default. Set
+`USE_GO_ENGINE=false` in the Compose environment to disable it. It communicates
+over a private Unix socket. FileToLink keeps its
+public routes and signed links, and falls back before sending any media if the
+engine is unavailable. Telegram user sessions and proxied clients use WZGram.
+
 #### Method B: Docker (Manual)
 
 ```bash

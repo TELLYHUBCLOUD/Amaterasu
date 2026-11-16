@@ -535,16 +535,23 @@ class TaskListener(TaskConfig):
             await start_from_queued()
 
         if self.join and not self.is_file:
-            if self.is_merge and self.merge_plan_id:
-                directories = [
-                    dirpath
-                    for dirpath, _, files in await sync_to_async(walk, up_path)
-                    if any(re_search(r"\.0+2$", name) for name in files)
-                ]
-                for directory in reversed(directories):
-                    await join_files(directory)
-            else:
-                await join_files(up_path)
+            try:
+                if self.is_merge and self.merge_plan_id:
+                    directories = [
+                        dirpath
+                        for dirpath, _, files in await sync_to_async(walk, up_path)
+                        if any(re_search(r"\.0+[12]$", name) for name in files)
+                    ]
+                    for directory in reversed(directories):
+                        await join_files(directory)
+                else:
+                    await join_files(up_path)
+            except OSError as error:
+                await self.on_download_error(
+                    f"Could not join split files. Downloaded data was kept. {error}",
+                    preserve_download=True,
+                )
+                return
 
         if self.extract and not self.is_nzb:
             up_path = await self.proceed_extract(up_path, gid)
@@ -1228,13 +1235,13 @@ class TaskListener(TaskConfig):
                     buttons.url_button(
                         "🔗 Rclone Link", share_url, style=ButtonStyle.PRIMARY
                     )
-                if not rclone_path and dir_id:
-                    INDEX_URL = self.user_dict.get("INDEX_URL", "") or ""
-                    if not INDEX_URL:
-                        INDEX_URL = Config.INDEX_URL or ""
-                    if INDEX_URL and self.name:
+                if not rclone_path and (dir_id or link and self.upload_index_url):
+                    index_url = self.upload_index_url
+                    if index_url is None:
+                        index_url = self.user_dict.get("INDEX_URL") or Config.INDEX_URL
+                    if index_url and self.name:
                         safe_name = rutils.quote(self.name.strip("/"))
-                        share_url = f"{INDEX_URL}/{safe_name}"
+                        share_url = f"{index_url.rstrip('/')}/{safe_name}"
                         if mime_type == "Folder":
                             share_url += "/"
                         buttons.url_button(
@@ -1299,7 +1306,7 @@ class TaskListener(TaskConfig):
 
         await start_from_queued()
 
-    async def on_download_error(self, error, button=None, is_limit=False):
+    async def on_download_error(self, error, button=None, is_limit=False, *, preserve_download=False):
         report_failure = True
         if self.is_merge:
             if self.folder_name and self.same_dir and self.folder_name in self.same_dir:
@@ -1385,7 +1392,7 @@ class TaskListener(TaskConfig):
 
         await start_from_queued()
         await sleep(3)
-        if not self.is_merge:
+        if not self.is_merge and not preserve_download:
             await clean_download(self.dir)
             if self.up_dir:
                 await clean_download(self.up_dir)

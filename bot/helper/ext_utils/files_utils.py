@@ -2,8 +2,11 @@ from aioshutil import rmtree as aiormtree, move
 from asyncio import create_subprocess_exec, sleep, wait_for
 from asyncio.subprocess import PIPE
 from psutil import disk_usage
-from os import path as ospath, readlink, walk
+from os import fsync, link, path as ospath, readlink, walk
+from pathlib import Path
 from re import I, escape, search as re_search, split as re_split
+from shutil import copyfileobj
+from tempfile import TemporaryDirectory
 
 from aiofiles.os import (
     listdir,
@@ -20,6 +23,7 @@ from ... import DOWNLOAD_DIR, LOGGER
 from ...core.torrent_manager import TorrentManager
 from .bot_utils import cmd_exec, sync_to_async
 from .exceptions import NotSupportedExtractionArchive
+from .rust_bridge import rust_core
 
 ARCH_EXT = [
     ".tar.bz2",
@@ -248,33 +252,56 @@ async def move_and_merge(source, destination, mid):
 
 
 async def join_files(opath):
-    files = await listdir(opath)
-    results = []
-    exists = False
-    for file_ in files:
-        if re_search(r"\.0+2$", file_) and await sync_to_async(
-            get_mime_type, f"{opath}/{file_}"
-        ) not in ["application/x-7z-compressed", "application/zip"]:
-            exists = True
-            final_name = file_.rsplit(".", 1)[0]
-            fpath = f"{opath}/{final_name}"
-            cmd = f'cat "{fpath}."* > "{fpath}"'
-            _, stderr, code = await cmd_exec(cmd, True)
-            if code != 0:
-                LOGGER.error(f"Failed to join {final_name}, stderr: {stderr}")
-                if await aiopath.isfile(fpath):
-                    await remove(fpath)
-            else:
-                results.append(final_name)
+    await sync_to_async(_join_files, Path(opath))
 
-    if not exists:
-        LOGGER.warning("No files to join!")
-    elif results:
-        LOGGER.info("Join Completed!")
-        for res in results:
-            for file_ in files:
-                if re_search(rf"{escape(res)}\.0[0-9]+$", file_):
-                    await remove(f"{opath}/{file_}")
+
+def _join_files(folder):
+    groups = {}
+    for part in folder.iterdir():
+        name, _, suffix = part.name.rpartition(".")
+        if name and re_search(r"^[0-9]{2,}\Z", suffix):
+            groups.setdefault(name, {}).setdefault(len(suffix), []).append((int(suffix), part))
+
+    for name, widths in groups.items():
+        candidates = [
+            parts for parts in widths.values()
+            if any(index == 2 for index, _ in parts)
+            or (len(parts) > 1 and any(index == 1 for index, _ in parts))
+        ]
+        if not candidates:
+            continue
+        if len(candidates) != 1:
+            raise OSError(f"Ambiguous split-file numbering for {name}")
+        numbered = candidates[0]
+        numbered.sort()
+        if len(numbered) > 1 and numbered[1][0] == 2 and get_mime_type(
+            str(numbered[1][1].resolve())
+        ) in ("application/x-7z-compressed", "application/zip"):
+            continue
+        if any(index != expected for expected, (index, _) in enumerate(numbered, 1)):
+            raise OSError(f"Split file {name} has missing or duplicate parts")
+
+        target = folder / name
+        if ospath.lexists(target):
+            raise FileExistsError(f"Join output already exists: {target}")
+        with TemporaryDirectory(prefix=".join-", dir=folder) as temp:
+            staged = Path(temp) / "merged"
+            native_join = getattr(rust_core(), "join_files", None)
+            if native_join is not None:
+                native_join([part for _, part in numbered], staged)
+            else:
+                with staged.open("wb") as output:
+                    for _, part in numbered:
+                        with part.open("rb") as source:
+                            copyfileobj(source, output, 1024 * 1024)
+                    output.flush()
+                    fsync(output.fileno())
+            # Publish atomically without replacing an output created by another job.
+            link(staged, target)
+
+        for _, part in numbered:
+            part.unlink(missing_ok=True)
+        LOGGER.info("Joined %s", name)
 
 
 async def split_file(f_path, split_size, listener):
