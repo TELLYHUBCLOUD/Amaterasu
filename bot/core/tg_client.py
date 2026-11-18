@@ -897,6 +897,10 @@ class TgClient:
 
     @classmethod
     async def start_helper_bots(cls):
+        if getenv("AMATERASU_GO_SOCKET"):
+            from bot.helper.ext_utils.go_bridge import register_go_tokens
+
+            await register_go_tokens(Config)
         helper_tokens = Config.helper_bot_tokens()
         if not helper_tokens:
             return

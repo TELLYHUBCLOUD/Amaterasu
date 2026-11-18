@@ -63,6 +63,10 @@ class HypertgUpload(HypertgTransfer):
         self._up_file = ospath.basename(file_path)
 
         thumb = user_thumb if user_thumb and user_thumb != "none" else None
+        # Thumbnails generated here live in the shared DOWNLOAD_DIR/thumbnails
+        # folder, outside the task directory, so they must be removed by us.
+        # Caller-supplied, user and yt-dlp thumbnails are never deleted here.
+        generated_thumbs = []
         if media_type is not None:
             key = media_type
         else:
@@ -78,6 +82,7 @@ class HypertgUpload(HypertgTransfer):
                     thumb = thumb_path.replace("/yt-dlp-thumb", "")
                 elif is_audio and not is_video:
                     thumb = await get_audio_thumbnail(file_path)
+                    generated_thumbs.append(thumb)
 
             if (
                 force_document
@@ -87,6 +92,7 @@ class HypertgUpload(HypertgTransfer):
                 key = "documents"
                 if is_video and thumb is None:
                     thumb = await get_video_thumbnail(file_path, None)
+                    generated_thumbs.append(thumb)
             elif is_video:
                 key = "videos"
                 duration = (await get_media_info(file_path))[0]
@@ -96,8 +102,10 @@ class HypertgUpload(HypertgTransfer):
                         self._listener.thumbnail_layout,
                         self._listener.screen_shots,
                     )
+                    generated_thumbs.append(thumb)
                 if thumb is None:
                     thumb = await get_video_thumbnail(file_path, duration)
+                    generated_thumbs.append(thumb)
                 if thumb is not None and thumb != "none":
                     with Image.open(thumb) as img:
                         width, height = img.size
@@ -208,11 +216,12 @@ class HypertgUpload(HypertgTransfer):
                     await remove(legacy_thumb)
                 except Exception:
                     pass
-            if user_thumb is None and thumb is not None and await aiopath.exists(thumb):
-                try:
-                    await remove(thumb)
-                except Exception:
-                    pass
+            for generated in generated_thumbs:
+                if generated and generated != "none" and await aiopath.exists(generated):
+                    try:
+                        await remove(generated)
+                    except Exception:
+                        pass
 
     async def _send_with_retry(self, send_func, **kwargs):
         client = send_func.__self__

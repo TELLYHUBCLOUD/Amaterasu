@@ -1,10 +1,10 @@
 from aioshutil import rmtree as aiormtree, move
-from asyncio import create_subprocess_exec, sleep, wait_for
+from asyncio import create_subprocess_exec, wait_for
 from asyncio.subprocess import PIPE
 from psutil import disk_usage
 from os import fsync, link, path as ospath, readlink, walk
 from pathlib import Path
-from re import I, escape, search as re_search, split as re_split
+from re import I, escape, findall as re_findall, search as re_search, split as re_split
 from shutil import copyfileobj
 from tempfile import TemporaryDirectory
 
@@ -368,31 +368,33 @@ class SevenZ:
             line = line.decode().strip()
             if match := re_search(pattern, line):
                 self._listener.subsize = int(match[1] or match[2])
-            await sleep(0.05)
-        s = b""
+        # 7z redraws progress in place (backspaces, no newlines), so read in
+        # chunks and keep only the latest "NN%". Reading byte-by-byte with a
+        # sleep could not keep up and let the pipe fill, stalling 7z.
+        tail = b""
         while not (
             self._listener.is_cancelled
             or self._listener.subproc.returncode is not None
             or self._listener.subproc.stdout.at_eof()
         ):
             try:
-                char = await wait_for(self._listener.subproc.stdout.read(1), 60)
+                chunk = await wait_for(self._listener.subproc.stdout.read(4096), 60)
             except Exception:
                 break
-            if not char:
+            if not chunk:
                 break
-            s += char
-            if char == b"%":
+            data = tail + chunk
+            percents = re_findall(rb"(\d{1,3})%", data)
+            if percents:
                 try:
-                    self._percentage = s.decode().rsplit(" ", 1)[-1].strip()
-                    self._processed_bytes = (
-                        int(self._percentage.strip("%")) / 100
-                    ) * self._listener.subsize
+                    value = min(int(percents[-1]), 100)
+                    self._percentage = f"{value}%"
+                    self._processed_bytes = (value / 100) * self._listener.subsize
                 except Exception:
                     self._processed_bytes = 0
                     self._percentage = "0%"
-                s = b""
-            await sleep(0.05)
+            # Keep a short tail so a "NN%" split across reads is still seen.
+            tail = data[-8:]
 
         self._processed_bytes = 0
         self._percentage = "0%"
@@ -438,7 +440,8 @@ class SevenZ:
     async def zip(self, dl_path, up_path, pswd):
         size = await get_path_size(dl_path)
         if self._listener.equal_splits:
-            parts = -(-size // self._listener.split_size)
+            # max(1, ...) keeps zero-byte content from dividing by zero.
+            parts = max(1, -(-size // self._listener.split_size))
             split_size = (size // parts) + (size % parts)
         else:
             split_size = self._listener.split_size

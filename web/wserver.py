@@ -6,6 +6,7 @@ from asyncio import (
     create_subprocess_exec,
     create_task,
     current_task,
+    shield,
     sleep,
     to_thread,
     wait_for,
@@ -59,7 +60,9 @@ from web.terabox_selection_store import (
     update_selected_ids as set_terabox_selected_ids,
 )
 from web.security import (
+    _b64decode as _security_b64decode,
     make_route_token,
+    make_signed_token,
     verify_route_token,
     verify_short_token,
     verify_signed_token,
@@ -281,16 +284,38 @@ app = FastAPI(lifespan=lifespan)
 app.include_router(filetolink_router)
 app.mount("/static", StaticFiles(directory="web/static"), name="static")
 templates = Jinja2Templates(directory="web/templates")
-_PLAYER_ASSET_VERSION = sha256(
-    b"".join(
-        (Path(__file__).parent / "static" / relative_path).read_bytes()
-        for relative_path in (
-            "css/player.css",
-            "js/libmedia-player.js",
-            "js/player.js",
-        )
-    )
-).hexdigest()[:12]
+
+
+def _ui_assets() -> dict:
+    """Entry files of the shared Svelte design system (web/ui).
+
+    `npm run build` in web/ui (a Docker build stage in production) writes
+    content-hashed files and .vite/manifest.json to web/static/dist. Every
+    page template links these via base.html. A missing build yields empty
+    values so the server still starts; pages then show their noscript note.
+    """
+    manifest = Path(__file__).parent / "static" / "dist" / ".vite" / "manifest.json"
+    try:
+        entry = json_loads(manifest.read_text(encoding="utf-8"))["src/main.ts"]
+    except (OSError, ValueError, KeyError):
+        return {"js": "", "css": [], "version": "dev"}
+    return {
+        "js": f"/static/dist/{entry['file']}",
+        "css": [f"/static/dist/{css}" for css in entry.get("css", [])],
+        "version": sha256(entry["file"].encode()).hexdigest()[:12],
+    }
+
+
+_UI_ASSETS = _ui_assets()
+# Kept for the player/playlist routes, which pass it to their templates.
+_PLAYER_ASSET_VERSION = _UI_ASSETS["version"]
+templates.env.globals["ui_assets"] = _UI_ASSETS
+try:
+    from bot.version import get_version as _get_app_version
+
+    templates.env.globals["app_version"] = _get_app_version()
+except Exception:  # pragma: no cover - version is cosmetic in the shell
+    templates.env.globals["app_version"] = ""
 STREAM_TOKEN_LENGTH = 24
 
 
@@ -358,6 +383,45 @@ def _route_stream_token_matches(token: str | None, chat_id, message_id: int) -> 
         if route_subject == (int(chat_id), int(message_id)):
             return True
     return False
+
+
+_SHORT_STREAM_TOKEN_RE = re_compile(rf"[A-Za-z0-9_-]{{{STREAM_TOKEN_LENGTH}}}")
+
+
+def _stream_token_precheck(token: str | None, chat_id, message_id: int) -> bool:
+    """Check a stream token as far as possible *before* asking Telegram for
+    the message, so unauthenticated requests can't probe private chats or
+    burn stream clients' rate limits.
+
+    Route tokens are fully verified here. Legacy signed tokens are verified
+    except for their file_unique_id binding, and legacy short tokens can only
+    be format-checked; both still get the full check after the fetch."""
+    if not isinstance(token, str) or not token:
+        return False
+    if _route_stream_token_matches(token, chat_id, message_id):
+        return True
+    if _SHORT_STREAM_TOKEN_RE.fullmatch(token):
+        return True
+    if "." in token:
+        try:
+            payload = json_loads(_security_b64decode(token.rsplit(".", 1)[0]))
+            extra = payload.get("x") or {}
+        except Exception:
+            return False
+        return isinstance(extra, dict) and verify_signed_token(
+            token,
+            _web_secret(),
+            "stream",
+            f"{chat_id}:{message_id}",
+            extra=extra,
+        )
+    return False
+
+
+def _require_stream_token_precheck(request: Request, chat_id, message_id: int, filename) -> None:
+    candidates = (request.query_params.get("hash"), filename)
+    if not any(_stream_token_precheck(c, chat_id, message_id) for c in candidates):
+        raise HTTPException(status_code=403, detail="Invalid secure token")
 
 
 def _require_profile_user(request: Request) -> int:
@@ -2086,46 +2150,18 @@ async def homepage(request: Request):
 # When Config.LOGIN_PASS is set, all admin routes require a session_token
 # cookie obtained via /login. Public routes (/, /health, /healthz, /metrics,
 # /stream/*, /dl/*, /watch/*, /login) are exempt. The session token is
-# an HMAC signature of "amaterasu_session" with the web secret — stateless,
-# no server-side session storage needed. Cookie expires in 7 days.
+# a signed payload (per-login nonce + expiry) keyed by the web secret and a
+# hash of LOGIN_PASS — stateless, no server-side session storage needed.
+# Expires after 7 days (checked server-side); changing LOGIN_PASS logs out
+# every session.
 
-_LOGIN_PAGE_HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Amaterasu — Login</title>
-<link rel="icon" href="/static/images/brand/favicon.ico" sizes="16x16 32x32 48x48">
-<link rel="icon" href="/static/images/brand/favicon.svg" type="image/svg+xml">
-<link rel="apple-touch-icon" href="/static/images/brand/apple-touch-icon.png">
-<style>
-body { font-family: -apple-system, system-ui, sans-serif; background: #f5f6f7;
-       display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
-.card { background: #fff; padding: 2rem; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-        width: 100%; max-width: 360px; }
-h1 { font-size: 1.5rem; margin: 0 0 1.5rem; color: #1d1f20; }
-label { display: block; margin-bottom: 0.5rem; font-size: 0.9rem; color: #476675; }
-input[type="password"] { width: 100%; padding: 0.6rem; border: 1px solid #c1cbd1;
-                         border-radius: 4px; font-size: 1rem; box-sizing: border-box; }
-button { width: 100%; padding: 0.7rem; background: #1c6d96; color: #fff; border: none;
-         border-radius: 4px; font-size: 1rem; cursor: pointer; margin-top: 1rem; }
-button:hover { background: #155a7e; }
-.error { color: #a0524a; font-size: 0.85rem; margin-top: 0.5rem; }
-</style>
-</head>
-<body>
-<div class="card">
-<img src="/static/images/brand/blackflare-ink.svg" width="56" height="56" alt="Amaterasu" style="display:block;margin-bottom:1rem">
-<h1>Amaterasu Login</h1>
-<form method="POST" action="/login">
-<label for="password">Password</label>
-<input type="password" id="password" name="password" autofocus required>
-{error_html}
-<button type="submit">Login</button>
-</form>
-</div>
-</body>
-</html>"""
+def _login_response(request: Request, error: str = "", status_code: int = 200):
+    """Render the owner sign-in page (templates/login.html, Svelte page "login")."""
+    response = templates.TemplateResponse(
+        request, "login.html", {"error": error}, status_code=status_code
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 # Admin routes that require login when LOGIN_PASS is set
 _ADMIN_PATH_PREFIXES = ("/app/", "/api/profiles", "/qbit/", "/nzb/")
@@ -2138,31 +2174,56 @@ _SIGNED_USER_TOOL_PATH_PREFIXES = (
     "/app/token-generator",
     "/api/token-generator",
     "/google-token/callback",
+    # Every handler under these paths calls its own _require_*_user check.
+    "/app/session-generator",
+    "/api/profiles",
 )
+# The encode-profiles page itself renders without a token (owner offline
+# mode), so it only bypasses the owner login when a valid per-user
+# encode-profile token is presented.
+_PROFILE_TOKEN_PAGE_PATHS = frozenset({"/app/encode-profiles"})
 # Public routes that never require login
 _PUBLIC_PATHS = frozenset(
     {"/", "/api/status", "/health", "/healthz", "/metrics", "/login"}
 )
 
 
+_SESSION_TTL = 7 * 24 * 3600
+
+
+def _session_key() -> str:
+    """Session signing key. Mixing in a hash of LOGIN_PASS means changing the
+    password invalidates every existing session cookie."""
+    password = str(getattr(_get_config(), "LOGIN_PASS", "") or "")
+    return f"{_web_secret()}:session:{sha256(password.encode('utf-8')).hexdigest()}"
+
+
 def _make_session_cookie() -> str:
-    """Create a signed session token. HMAC of 'amaterasu_session' with
-    the web secret. Stateless — no server-side storage."""
-    from hmac import new as hmac_new
-    from hashlib import sha256
-    from base64 import urlsafe_b64encode
-    secret = _web_secret().encode("utf-8")
-    mac = hmac_new(secret, b"amaterasu_session", sha256).digest()
-    return urlsafe_b64encode(mac).decode("ascii").rstrip("=")
+    """Create a signed session token with a per-login nonce and an expiry
+    that is enforced server-side (not just by the browser's max_age)."""
+    from secrets import token_hex
+
+    return make_signed_token(
+        _session_key(),
+        "admin-session",
+        token_hex(16),
+        ttl=_SESSION_TTL,
+    )
 
 
 def _verify_session_cookie(token: str | None) -> bool:
-    """Verify the session cookie against the expected HMAC."""
-    if not token:
+    """Verify the session cookie's signature and server-side expiry."""
+    if not token or "." not in token:
         return False
-    from hmac import compare_digest
-    expected = _make_session_cookie()
-    return compare_digest(token, expected)
+    try:
+        payload = json_loads(_security_b64decode(token.rsplit(".", 1)[0]))
+        subject = str(payload["s"])
+        expires_at = int(payload.get("e") or 0)
+    except Exception:
+        return False
+    if expires_at <= 0:
+        return False
+    return verify_signed_token(token, _session_key(), "admin-session", subject)
 
 
 def _login_pass_configured() -> bool:
@@ -2179,8 +2240,7 @@ async def login_page(request: Request, error: str | None = None):
         # If LOGIN_PASS is not set, redirect to home — no login needed
         from fastapi.responses import RedirectResponse
         return RedirectResponse(url="/", status_code=302)
-    error_html = f'<p class="error">{error}</p>' if error else ""
-    return HTMLResponse(_LOGIN_PAGE_HTML.replace("{error_html}", error_html))
+    return _login_response(request, error or "")
 
 
 @app.post("/login")
@@ -2201,19 +2261,14 @@ async def login_submit(request: Request):
             httponly=True,
             samesite="strict",
             secure=request.url.scheme == "https",
-            max_age=7 * 24 * 3600,  # 7 days
+            max_age=_SESSION_TTL,  # also enforced server-side
             path="/",
         )
         from fastapi.responses import RedirectResponse
         return RedirectResponse(url="/", status_code=302, headers={
             "set-cookie": response.headers.get("set-cookie", "")
         })
-    return HTMLResponse(
-        _LOGIN_PAGE_HTML.replace(
-            "{error_html}", '<p class="error">Incorrect password.</p>'
-        ),
-        status_code=401,
-    )
+    return _login_response(request, "Incorrect password.", status_code=401)
 
 
 @app.middleware("http")
@@ -2232,6 +2287,13 @@ async def login_gate(request: Request, call_next):
         return await call_next(request)
     if path.startswith(_SIGNED_USER_TOOL_PATH_PREFIXES):
         return await call_next(request)
+    if path in _PROFILE_TOKEN_PAGE_PATHS:
+        try:
+            _require_profile_user(request)
+        except HTTPException:
+            pass
+        else:
+            return await call_next(request)
     # If LOGIN_PASS is not set, allow everything (v1.5.0 behavior)
     if not _login_pass_configured():
         return await call_next(request)
@@ -2830,6 +2892,11 @@ def _stream_client_choices() -> list[tuple[int, any]]:
     return sorted(TgClient.stream_clients.items(), key=client_rank)
 
 
+# FloodWait handling while resolving a message for a stream request.
+_MESSAGE_FLOOD_WAIT_MAX = 5
+_MESSAGE_FLOOD_RETRIES = 2
+
+
 def _acquire_stream_client(client_id: int) -> None:
     from bot.core.tg_client import TgClient
 
@@ -2881,12 +2948,22 @@ def get_media_type(message):
 async def get_message(client, chat_id: int, message_id: int) -> any:
     import asyncio
     from pyrogram.errors import FloodWait
+    flood_retries = 0
     while True:
         try:
             message = await client.get_messages(chat_id, message_id)
             break
         except FloodWait as e:
-            await asyncio.sleep(e.value)
+            # Don't park a viewer (and a stream-load slot) behind a long
+            # cooldown: give up on this client so the caller tries the next.
+            wait = int(getattr(e, "value", 0) or 0)
+            if wait > _MESSAGE_FLOOD_WAIT_MAX or flood_retries >= _MESSAGE_FLOOD_RETRIES:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Stream client is rate limited ({wait}s)",
+                ) from e
+            flood_retries += 1
+            await asyncio.sleep(wait)
         except Exception as e:
             from bot import LOGGER
             LOGGER.error(f"Failed to fetch message {message_id} from {chat_id}: {e}")
@@ -2900,17 +2977,23 @@ async def get_message_with_stream_client(chat_id: int, message_id: int) -> tuple
     last_error = None
     for client_id, client in _stream_client_choices():
         _acquire_stream_client(client_id)
+        acquired = True
         try:
             message = await get_message(client, chat_id, message_id)
+            acquired = False  # ownership of the slot passes to the caller
             return client_id, client, message
         except HTTPException as e:
             last_error = e
             _record_stream_failure(client_id, e.detail)
-            _release_stream_load(client_id)
             LOGGER.warning(
                 f"FileToLink stream client {client_id} cannot fetch "
                 f"{chat_id}/{message_id}: {e.detail}"
             )
+        finally:
+            # Also runs on CancelledError (client disconnected mid-fetch),
+            # which previously leaked the slot permanently.
+            if acquired:
+                _release_stream_load(client_id)
 
     if last_error:
         raise last_error
@@ -2959,6 +3042,47 @@ def _normalize_mime_type(filename: str, mime_type: str | None) -> str:
     if not mime or mime == "application/octet-stream":
         return guessed or mime or "application/octet-stream"
     return mime
+
+
+# Types a browser can render inline from our origin without executing script.
+_INLINE_SAFE_MIME_TYPES = frozenset(
+    {
+        "application/pdf",
+        "text/plain",
+        "text/vtt",
+        "text/csv",
+        "application/x-subrip",
+        "application/ogg",
+        "application/x-mpegurl",
+        "application/vnd.apple.mpegurl",
+    }
+)
+_TEXTUAL_MIME_TYPES = frozenset(
+    {"application/json", "application/xml", "application/javascript"}
+)
+
+
+def _safe_disposition_and_type(disposition: str, mime_type: str) -> tuple[str, str]:
+    """Stop user-uploaded HTML/SVG/XML from rendering as an active document on
+    our origin (stored XSS). Media and plain text stay inline; other textual
+    types are shown inline as text/plain (the player's text preview); anything
+    else is forced to download."""
+    if disposition != "inline":
+        return disposition, mime_type
+    base = (mime_type or "").split(";", 1)[0].strip().lower()
+    if (
+        base.startswith(("video/", "audio/"))
+        or (base.startswith("image/") and base != "image/svg+xml")
+        or base in _INLINE_SAFE_MIME_TYPES
+    ):
+        return disposition, mime_type
+    if base != "image/svg+xml" and (
+        base.startswith("text/")
+        or base in _TEXTUAL_MIME_TYPES
+        or base.endswith(("+xml", "+json"))
+    ):
+        return disposition, "text/plain; charset=utf-8"
+    return "attachment", mime_type
 
 
 def _absolute_public_url(request: Request, path: str) -> str:
@@ -3505,7 +3629,10 @@ def _begin_progressive_cache(
     filename: str,
     file_size: int,
 ) -> tuple[str, Path, Path] | None:
-    """Reserve a write-through cache file for one complete live response."""
+    """Reserve a write-through cache file for one complete live response.
+
+    Runs in a worker thread (see stream_media): pruning walks the cache tree
+    and unlinks multi-GB files, which stalled the event loop."""
     if file_size <= 0 or file_size > FILETOLINK_CACHE_MAX_BYTES:
         return None
     if FILETOLINK_CACHE_TOTAL_MAX_BYTES and file_size > FILETOLINK_CACHE_TOTAL_MAX_BYTES:
@@ -3515,20 +3642,52 @@ def _begin_progressive_cache(
     cache_key = cache_path.stem
     if cache_key in _filetolink_cache_writers:
         return None
+    # Claim immediately after the check (before any I/O) so concurrent
+    # requests can't both become writers. The prune below then counts this
+    # reservation itself, so it asks for no extra headroom.
+    _filetolink_cache_writers.add(cache_key)
+    _filetolink_cache_reservations[cache_key] = file_size
 
     try:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        _prune_filetolink_cache(file_size)
-    except OSError as error:
+        _prune_filetolink_cache(0)
+    except BaseException as error:
+        _filetolink_cache_writers.discard(cache_key)
+        _filetolink_cache_reservations.pop(cache_key, None)
+        if not isinstance(error, OSError):
+            raise
         LOGGER.warning("FileToLink cache disabled; cannot prepare cache: %s", error)
         return None
 
     temp_path = cache_path.with_name(
         f"{cache_path.name}.{token_urlsafe(6)}.part"
     )
-    _filetolink_cache_writers.add(cache_key)
-    _filetolink_cache_reservations[cache_key] = file_size
     return cache_key, temp_path, cache_path
+
+
+async def _reserve_progressive_cache(chat_id, message_id, unique_id, filename, file_size):
+    """Run _begin_progressive_cache off the event loop. If the request is
+    cancelled while the worker thread is still running, release whatever it
+    reserved once it finishes instead of leaking the writer slot/budget."""
+    task = create_task(
+        to_thread(
+            _begin_progressive_cache,
+            chat_id,
+            message_id,
+            unique_id,
+            filename,
+            file_size,
+        )
+    )
+    try:
+        return await shield(task)
+    except CancelledError:
+        def release(done):
+            if not done.cancelled() and done.exception() is None:
+                _finish_progressive_cache(done.result(), file_size, False)
+
+        task.add_done_callback(release)
+        raise
 
 
 def _finish_progressive_cache(
@@ -3734,13 +3893,11 @@ async def embedded_subtitle(token: str, track_index: int):
         chat_id,
         message_id,
     )
-    media = get_media(message)
-    file_size = int(getattr(media, "file_size", 0) or 0)
-    if file_size <= 0:
-        _release_stream_load(client_id)
-        raise HTTPException(status_code=404, detail="Media size is unavailable")
-
     try:
+        media = get_media(message)
+        file_size = int(getattr(media, "file_size", 0) or 0)
+        if file_size <= 0:
+            raise HTTPException(status_code=404, detail="Media size is unavailable")
         process = await create_subprocess_exec(
             _FFMPEG_BIN,
             "-hide_banner",
@@ -3766,6 +3923,11 @@ async def embedded_subtitle(token: str, track_index: int):
     except FileNotFoundError as error:
         _release_stream_load(client_id)
         raise HTTPException(status_code=503, detail="FFmpeg is unavailable") from error
+    except BaseException:
+        # Includes CancelledError from a client disconnect; without this the
+        # stream-load slot was never released.
+        _release_stream_load(client_id)
+        raise
 
     async def feed_media():
         try:
@@ -3932,11 +4094,12 @@ async def watch_media(chat_id: str, message_id: int, request: Request, filename:
     except ValueError:
         pass
 
+    _require_stream_token_precheck(request, chat_id, message_id, filename)
     client_id, client, message = await get_message_with_stream_client(chat_id, message_id)
 
     try:
         media = get_media(message)
-        
+
         unique_id = getattr(media, "file_unique_id", "")
         secure_hash = request.query_params.get("hash")
         if not secure_hash and _verify_stream_token(filename, chat_id, message_id, unique_id):
@@ -3944,10 +4107,10 @@ async def watch_media(chat_id: str, message_id: int, request: Request, filename:
             filename = None
         if not _verify_stream_token(secure_hash, chat_id, message_id, unique_id):
             raise HTTPException(status_code=403, detail="Invalid secure token")
-            
+
         if not filename:
             filename = _resolve_filename(message, media, message_id)
-            
+
         file_size = getattr(media, "file_size", 0) or 0
         mime_type = _normalize_mime_type(filename, getattr(media, "mime_type", None))
         from bot.helper.ext_utils.status_utils import get_readable_file_size
@@ -4030,6 +4193,7 @@ async def stream_media(chat_id: str, message_id: int, request: Request, filename
         pass
     from bot.core.tg_client import TgClient
 
+    _require_stream_token_precheck(request, chat_id, message_id, filename)
     client_id, client, message = await get_message_with_stream_client(chat_id, message_id)
 
     try:
@@ -4058,6 +4222,10 @@ async def stream_media(chat_id: str, message_id: int, request: Request, filename
         if not filename:
             filename = _resolve_filename(message, media, message_id)
         mime_type = _normalize_mime_type(filename, mime_type)
+        if request.headers.get("X-Amaterasu-Go-Fallback") == "1":
+            from bot.helper.ext_utils.go_bridge import publish_go_metadata
+
+            await publish_go_metadata(client, chat_id, message_id, media, filename, mime_type)
         
         range_header = request.headers.get("Range")
         etag_seed = unique_id or f"{chat_id}:{message_id}:{file_size}"
@@ -4074,6 +4242,7 @@ async def stream_media(chat_id: str, message_id: int, request: Request, filename
             disposition = request.query_params.get("disposition", "attachment").strip().lower()
         if disposition not in VALID_DISPOSITIONS:
             disposition = "attachment"
+        disposition, mime_type = _safe_disposition_and_type(disposition, mime_type)
 
         from bot.helper.ext_utils.status_utils import get_readable_file_size
         readable_size = get_readable_file_size(file_size)
@@ -4091,6 +4260,10 @@ async def stream_media(chat_id: str, message_id: int, request: Request, filename
             "X-Content-Type-Options": "nosniff",
             **CORS_HEADERS,
         }
+        if mime_type.split(";", 1)[0].strip().lower() != "application/pdf":
+            # Opaque-origin, script-free document if it is ever rendered
+            # top-level. Skipped for PDF, where it breaks Chrome's viewer.
+            headers["Content-Security-Policy"] = "sandbox"
         headers["ETag"] = etag
         
         if ranged_response:
@@ -4105,7 +4278,8 @@ async def stream_media(chat_id: str, message_id: int, request: Request, filename
             _release_stream_load(client_id)
             return response
 
-        cached_path = _existing_cached_media(
+        cached_path = await to_thread(
+            _existing_cached_media,
             chat_id,
             message_id,
             unique_id,
@@ -4239,7 +4413,7 @@ async def stream_media(chat_id: str, message_id: int, request: Request, filename
                 # ran after every successful response and stole bandwidth from
                 # concurrent users.
                 if start == 0 and end == file_size - 1:
-                    cache_reservation = _begin_progressive_cache(
+                    cache_reservation = await _reserve_progressive_cache(
                         chat_id,
                         message_id,
                         unique_id,
@@ -4412,9 +4586,11 @@ async def stream_media(chat_id: str, message_id: int, request: Request, filename
             headers=headers
         )
         
-    except Exception as e:
+    except BaseException:
+        # BaseException so a client disconnect (CancelledError) during setup
+        # (e.g. awaiting Go metadata publication) still frees the slot.
         _release_stream_load(client_id)
-        raise e
+        raise
 
 
 @app.exception_handler(Exception)

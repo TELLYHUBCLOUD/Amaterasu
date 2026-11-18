@@ -7,8 +7,16 @@
 !.env.example
 .venv
 rust-core/target
+# Plain "__pycache__" / "*.pyc" only match at the repo root; ** covers subfolders.
 __pycache__
+**/__pycache__
 *.pyc
+**/*.pyc
+# Not read at runtime (checked: no references from bot/, web/, plugins/ or scripts).
+tests
+docs
+branding
+.runtime
 .pytest_cache
 .pytest-cache
 .ruff_cache
@@ -29,3 +37,6 @@ rclone
 credentials.json
 rclone.conf
 .netrc
+
+web/ui/node_modules
+web/static/dist

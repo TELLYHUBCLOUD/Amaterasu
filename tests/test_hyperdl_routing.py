@@ -1823,7 +1823,7 @@ def test_locked_merge_plan_rejects_late_reorder(merge_plan_store_fixture):
 
 
 def test_merge_planner_assets_keep_unattended_tasks_automatic():
-    javascript = (ROOT / "web/static/js/merge-planner.js").read_text(
+    javascript = (ROOT / "web/ui/src/pages/merge-planner/Page.svelte").read_text(
         encoding="utf-8"
     )
     listener = (ROOT / "bot/helper/listeners/task_listener.py").read_text(

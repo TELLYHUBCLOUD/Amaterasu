@@ -1085,10 +1085,10 @@ def test_profile_entry_points_normalize_saved_data_and_default_label_is_dynamic(
     task_listener = (
         ROOT / "bot" / "helper" / "listeners" / "task_listener.py"
     ).read_text(encoding="utf-8")
-    encode_js = (ROOT / "web" / "static" / "js" / "encode.js").read_text(
-        encoding="utf-8"
-    )
-    encode_html = (
+    page_dir = ROOT / "web" / "ui" / "src" / "pages" / "encode-profiles"
+    encode_js = (page_dir / "profile.ts").read_text(encoding="utf-8")
+    encode_html = (page_dir / "Page.svelte").read_text(encoding="utf-8")
+    encode_template = (
         ROOT / "web" / "templates" / "encode_profiles.html"
     ).read_text(encoding="utf-8")
 
@@ -1103,6 +1103,10 @@ def test_profile_entry_points_normalize_saved_data_and_default_label_is_dynamic(
     assert "svtParts.push(`preset=${profile.video_params.preset}`)" in encode_js
     assert "part => !part.startsWith('keyint=')" in encode_js
     assert "if (!useAutomaticTimestamps) cmd += `  -cluster_time_limit 5000 `" in encode_js
-    assert '<option value="yuv420p" selected>' in encode_html
-    assert '<option value="2">2 seconds (Smooth seeking)</option>' in encode_html
-    assert ".profile-card { flex: 0 0 auto;" in encode_html
+    # The editor defaults to 8-bit 4:2:0 and offers the 2-second AV1 seek interval.
+    assert 'pixFmt: "yuv420p",' in encode_js
+    assert '{ value: "2", label: "2 seconds (Smooth seeking)" }' in encode_js
+    # Profiles render as rows that keep their actions instead of shrinking.
+    assert 'class="inset profile-row"' in encode_html
+    assert "{% block page %}encode-profiles{% endblock %}" in encode_template
+    assert not (ROOT / "web" / "static" / "js" / "encode.js").exists()

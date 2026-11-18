@@ -1,0 +1,445 @@
+<script lang="ts">
+  import { onMount } from "svelte";
+  import Activity from "@lucide/svelte/icons/activity";
+  import Cpu from "@lucide/svelte/icons/cpu";
+  import Clock from "@lucide/svelte/icons/clock";
+  import MemoryStick from "@lucide/svelte/icons/memory-stick";
+  import Download from "@lucide/svelte/icons/download";
+  import Link2 from "@lucide/svelte/icons/link-2";
+  import FileText from "@lucide/svelte/icons/file-text";
+  import Shield from "@lucide/svelte/icons/shield";
+  import Film from "@lucide/svelte/icons/film";
+  import Rss from "@lucide/svelte/icons/rss";
+  import ArrowUpRight from "@lucide/svelte/icons/arrow-up-right";
+  import Shell, { type NavGroup } from "../../ui/Shell.svelte";
+  import Icon from "../../ui/Icon.svelte";
+  import Feedback from "../../ui/Feedback.svelte";
+  import Stack from "./Stack.svelte";
+
+  // Public overview of this instance: what Amaterasu is, its live status
+  // (polled from /api/status every 3s, the same feed the old page used),
+  // its components and its architecture.
+  let { data }: { data: { version?: string; bot_name?: string } } = $props();
+
+  const version = $derived(data.version ?? "");
+  const SOURCE = "https://github.com/Zan-getsu/Amaterasu";
+
+  type Status = { active_tasks: number; cpu: number; ram: number; uptime: string };
+  let status = $state<Status | null>(null);
+  let failed = $state(false);
+
+  const nav: NavGroup[] = [
+    {
+      label: "Instance",
+      items: [
+        { label: "Overview", href: "#overview", icon: "home", current: true },
+        { label: "Live status", href: "#status", icon: "pulse" },
+        { label: "Components", href: "#components", icon: "layers" },
+        { label: "Architecture", href: "#architecture", icon: "workflow" },
+      ],
+    },
+  ];
+
+  const components = [
+    {
+      icon: Download,
+      title: "Multi-engine downloads",
+      tag: "Core",
+      text: "Aria2c, qBittorrent, JDownloader and Sabnzbd under one interface, with automatic engine selection.",
+    },
+    {
+      icon: Link2,
+      title: "FileToLink streaming",
+      tag: "F2L",
+      text: "Direct download and streamable links for Telegram files, with token-based authentication.",
+    },
+    {
+      icon: FileText,
+      title: "Auto-rename engine",
+      tag: "Smart",
+      text: "File renaming with pattern matching, episode detection and custom template variables.",
+    },
+    {
+      icon: Shield,
+      title: "Resilience",
+      tag: "Robust",
+      text: "Automatic retry, connection pooling, multi-account rotation and graceful degradation.",
+    },
+    {
+      icon: Film,
+      title: "Media processing",
+      tag: "FFmpeg",
+      text: "FFmpeg encoding with profile presets, codec selection and quality optimisation.",
+    },
+    {
+      icon: Rss,
+      title: "RSS automation",
+      tag: "Auto",
+      text: "Watch feeds, download new episodes automatically and organise them by category.",
+    },
+  ];
+
+  async function refresh() {
+    try {
+      const res = await fetch("/api/status", { headers: { Accept: "application/json" } });
+      if (!res.ok) throw new Error(String(res.status));
+      status = (await res.json()) as Status;
+      failed = false;
+    } catch {
+      failed = true;
+    }
+  }
+
+  const pct = (n: number | undefined) =>
+    n == null || !Number.isFinite(Number(n)) ? "—" : `${Math.round(Number(n))}`;
+
+  onMount(() => {
+    void refresh();
+    let timer = setInterval(refresh, 3000);
+    // Stop polling while the tab is hidden; catch up when it returns.
+    const onVisibility = () => {
+      clearInterval(timer);
+      if (document.visibilityState === "visible") {
+        void refresh();
+        timer = setInterval(refresh, 3000);
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  });
+</script>
+
+<Shell place="Overview" {nav} note="Self-hosted. Status refreshes every 3 seconds.">
+  <div class="page">
+    <section class="hero" aria-labelledby="overview">
+      <div class="hero-copy">
+        <h1 id="overview" tabindex="-1">Amaterasu</h1>
+        <p class="hero-lead">
+          Self-hosted Telegram mirroring with multi-engine downloads and media processing.
+        </p>
+        <div class="hero-meta">
+          {#if version}
+            <span class="pill"><Icon icon={Shield} size={12} /> {version}</span>
+          {/if}
+          <span class="pill" data-tone={status ? "success" : failed ? "danger" : undefined}>
+            <span class="dot"></span>
+            {status ? "Online" : failed ? "Unreachable" : "Checking…"}
+          </span>
+          {#if data.bot_name}<span class="pill">Node: {data.bot_name}</span>{/if}
+        </div>
+        <div class="hero-actions">
+          <a class="btn btn-primary" href="#status">
+            Live status
+            <Icon name="arrow-right" size={16} />
+          </a>
+          <a class="btn" href={SOURCE} target="_blank" rel="noopener noreferrer">
+            Source
+            <Icon icon={ArrowUpRight} size={16} />
+          </a>
+        </div>
+      </div>
+
+      <figure class="hero-figure" id="architecture">
+        <Stack {version} />
+        <figcaption class="note">
+          How a task moves: Telegram in, through the engines and processing, out to your destinations.
+        </figcaption>
+      </figure>
+    </section>
+
+    <section id="status" aria-labelledby="status-title" class="section">
+      <div class="page-head">
+        <div>
+          <h2 id="status-title">Live status</h2>
+          <p>Read from this instance every three seconds.</p>
+        </div>
+      </div>
+
+      {#if failed}
+        <Feedback tone="warning" announcement="status">
+          Status is not reachable right now. Retrying automatically.
+        </Feedback>
+      {/if}
+
+      <div class="stats" aria-live="off">
+        <article class="card stat">
+          <header class="stat-head">
+            <span class="tile"><Icon icon={Activity} size={17} /></span>
+            <h3>Active tasks</h3>
+          </header>
+          <p class="stat-value">{status ? status.active_tasks : "—"}</p>
+          <p class="stat-note">Downloads, uploads and processing in flight</p>
+        </article>
+        <article class="card stat">
+          <header class="stat-head">
+            <span class="tile"><Icon icon={Cpu} size={17} /></span>
+            <h3>Server CPU</h3>
+          </header>
+          <p class="stat-value">{status ? `${pct(status.cpu)}%` : "—"}</p>
+          <div class="stat-bar">
+            <div
+              class="progress"
+              role="progressbar"
+              aria-label="Server CPU"
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuenow={status ? Number(status.cpu) : 0}
+              style:--value="{status ? Math.min(100, Number(status.cpu)) : 0}%"
+            >
+              <span></span>
+            </div>
+          </div>
+        </article>
+        <article class="card stat">
+          <header class="stat-head">
+            <span class="tile"><Icon icon={MemoryStick} size={17} /></span>
+            <h3>Memory</h3>
+          </header>
+          <p class="stat-value">{status ? `${pct(status.ram)}%` : "—"}</p>
+          <div class="stat-bar">
+            <div
+              class="progress"
+              role="progressbar"
+              aria-label="Memory in use"
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuenow={status ? Number(status.ram) : 0}
+              style:--value="{status ? Math.min(100, Number(status.ram)) : 0}%"
+            >
+              <span></span>
+            </div>
+          </div>
+        </article>
+        <article class="card stat">
+          <header class="stat-head">
+            <span class="tile"><Icon icon={Clock} size={17} /></span>
+            <h3>Uptime</h3>
+          </header>
+          <p class="stat-value uptime">{status ? status.uptime : "—"}</p>
+          <p class="stat-note">Since the bot last started</p>
+        </article>
+      </div>
+    </section>
+
+    <section id="components" aria-labelledby="components-title" class="section">
+      <div class="page-head">
+        <div>
+          <h2 id="components-title">Components</h2>
+          <p>The toolkit behind every mirror, leech and stream.</p>
+        </div>
+      </div>
+
+      <div class="panel components">
+        <ul class="rows component-list">
+          {#each components as c (c.title)}
+            <li class="inset row component">
+              <span class="tile"><Icon icon={c.icon} size={17} /></span>
+              <div class="row-main">
+                <span class="component-head">
+                  <span class="row-title">{c.title}</span>
+                  <span class="pill">{c.tag}</span>
+                </span>
+                <span class="component-text">{c.text}</span>
+              </div>
+            </li>
+          {/each}
+        </ul>
+      </div>
+    </section>
+
+    <footer class="foot">
+      <span class="foot-brand">© 2026 Amaterasu — Black Sun Infrastructure</span>
+      <a href={SOURCE} target="_blank" rel="noopener noreferrer">
+        Source on GitHub <Icon icon={ArrowUpRight} size={14} />
+      </a>
+    </footer>
+  </div>
+</Shell>
+
+<style>
+  .page {
+    gap: var(--space-10);
+  }
+
+  /* ── Hero: the overview card with the architecture stack ─────── */
+  .hero {
+    position: relative;
+    display: grid;
+    grid-template-columns: minmax(0, 0.85fr) minmax(0, 1.15fr);
+    gap: var(--space-8);
+    align-items: center;
+    padding: clamp(1.5rem, 1rem + 2.5vw, 3rem);
+    border: var(--border-width) solid transparent;
+    border-radius: var(--radius-xl);
+    background:
+      radial-gradient(
+          60% 90% at 100% 0%,
+          light-dark(oklch(0.94 0 0 / 0.7), oklch(0.3 0 0 / 0.35)),
+          transparent 70%
+        )
+        padding-box,
+      var(--surface-raised) padding-box,
+      var(--card-edge) border-box;
+    box-shadow: var(--shadow-card);
+    overflow: hidden;
+  }
+
+  /* Light from the upper right, and a diagonal sheen across the hero. */
+  .hero::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    background:
+      linear-gradient(115deg, transparent 40%, var(--sheen) 55%, transparent 68%),
+      radial-gradient(60% 90% at 100% 0%, var(--glow-accent), transparent 70%);
+    opacity: 0.9;
+  }
+
+  .hero > * {
+    position: relative;
+  }
+
+  h1 {
+    font-size: var(--text-display);
+    font-weight: 520;
+    letter-spacing: var(--tracking-display);
+    line-height: 0.95;
+  }
+
+  .hero-lead {
+    margin-top: var(--space-4);
+    max-width: 24ch;
+    font-size: clamp(1.125rem, 1rem + 0.6vw, 1.5rem);
+    line-height: 1.3;
+    color: var(--text);
+    font-weight: 420;
+    letter-spacing: -0.018em;
+  }
+
+  .hero-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    margin-top: var(--space-5);
+  }
+
+  .hero-actions {
+    display: flex;
+    gap: var(--space-3);
+    flex-wrap: wrap;
+    margin-top: var(--space-6);
+  }
+
+  .hero-figure {
+    margin: 0;
+    display: grid;
+    gap: var(--space-3);
+    scroll-margin-top: calc(var(--topbar-height) + var(--space-4));
+  }
+
+  /* ── Sections ────────────────────────────────────────────────── */
+  .section {
+    display: grid;
+    gap: var(--space-4);
+    scroll-margin-top: calc(var(--topbar-height) + var(--space-4));
+  }
+
+  .section .page-head {
+    margin-bottom: 0;
+  }
+
+  .stat-bar {
+    margin-top: var(--space-2);
+  }
+
+  .uptime {
+    font-size: clamp(1.5rem, 1.2rem + 1vw, 2.25rem);
+  }
+
+  .components {
+    padding: var(--space-3);
+  }
+
+  .component-list {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .component {
+    align-items: flex-start;
+    padding: var(--space-4);
+  }
+
+  .component-head {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+  }
+
+  .component-text {
+    margin-top: var(--space-1);
+    font-size: var(--text-small);
+    color: var(--text-secondary);
+    line-height: 1.5;
+  }
+
+  .foot {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+    padding-top: var(--space-5);
+    border-top: var(--border-width) solid var(--line);
+    font-size: var(--text-small);
+    color: var(--text-muted);
+  }
+
+  .foot a {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+    min-height: var(--control-height);
+    color: var(--text-secondary);
+    text-decoration: none;
+  }
+
+  .foot a:hover {
+    color: var(--text);
+  }
+
+  @media (max-width: 64rem) {
+    .hero {
+      grid-template-columns: minmax(0, 1fr);
+    }
+  }
+
+  @media (max-width: 48rem) {
+    .component-list {
+      grid-template-columns: minmax(0, 1fr);
+    }
+  }
+
+  @media (max-width: 40rem) {
+    .stats {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: var(--space-3);
+    }
+    .stat {
+      padding: var(--space-4);
+    }
+    .stat-value {
+      font-size: 1.75rem;
+    }
+    .uptime {
+      font-size: 1.25rem;
+    }
+    .components {
+      padding: var(--space-2);
+    }
+  }
+</style>

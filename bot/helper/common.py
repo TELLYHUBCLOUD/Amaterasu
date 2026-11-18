@@ -1517,8 +1517,12 @@ class TaskConfig:
                         del_path = ospath.join(dirpath, file_)
                         try:
                             await remove(del_path)
-                        except Exception:
+                        except Exception as error:
                             self.is_cancelled = True
+                            await self.on_download_error(
+                                f"Could not remove extracted archive {file_}: {error}"
+                            )
+                            return dl_path
         if extraction_failed:
             await send_message(
                 self.message,
@@ -1531,10 +1535,15 @@ class TaskConfig:
     async def proceed_ffmpeg(self, dl_path, gid):
         checked = False
         lock_acquired = False
-        cmds = [
-            [part.strip() for part in split(item) if part.strip()]
-            for item in self.ffmpeg_cmds
-        ]
+        cmds = []
+        for item in self.ffmpeg_cmds:
+            try:
+                parts = [part.strip() for part in split(item) if part.strip()]
+            except ValueError as error:
+                raise ValueError(f"Invalid FFmpeg command {item!r}: {error}") from None
+            if "-i" not in parts or parts.index("-i") + 1 >= len(parts):
+                raise ValueError(f"Invalid FFmpeg command {item!r}: missing -i input")
+            cmds.append(parts)
         try:
             ffmpeg = FFMpeg(self)
             for ffmpeg_cmd in cmds:
@@ -1849,8 +1858,11 @@ class TaskConfig:
                     if res:
                         try:
                             await remove(f_path)
-                        except Exception:
+                        except Exception as error:
                             self.is_cancelled = True
+                            await self.on_download_error(
+                                f"Could not remove processed source {ospath.basename(f_path)}: {error}"
+                            )
                             return False
                         if self.is_file:
                             return res
@@ -1888,8 +1900,11 @@ class TaskConfig:
                     if res:
                         try:
                             await remove(f_path)
-                        except Exception:
+                        except Exception as error:
                             self.is_cancelled = True
+                            await self.on_download_error(
+                                f"Could not remove processed source {ospath.basename(f_path)}: {error}"
+                            )
                             return False
                         if self.is_file:
                             return res
@@ -2244,8 +2259,11 @@ class TaskConfig:
                     return False
                 try:
                     await remove(f_path)
-                except Exception:
+                except Exception as error:
                     self.is_cancelled = True
+                    await self.on_download_error(
+                        f"Could not remove split source {ospath.basename(f_path)}: {error}"
+                    )
                     return False
 
     def parse_metadata_string(self, metadata_str):
