@@ -9,6 +9,9 @@ WORKDIR /src/web/ui
 COPY web/ui/package.json web/ui/package-lock.json ./
 RUN npm ci --no-audit --no-fund
 COPY web/ui/ ./
+# The player page imports the vanilla runtime from web/static/js (kept there
+# for its tests), so it must exist at /src/web/static/js during the build.
+COPY web/static/js/ /src/web/static/js/
 RUN npm run build
 
 FROM ${BASE_IMAGE}
