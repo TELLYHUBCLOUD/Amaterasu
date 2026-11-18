@@ -211,6 +211,9 @@ RUN set -eux; \
         --with-sqlite3; \
     make -j"$(nproc)"; \
     make install; \
+    # autotools builds with -g by default; strip in this same layer so the
+    # debug symbols never reach the image (a later RUN could not shrink it).
+    strip --strip-unneeded /usr/local/bin/aria2c; \
     ldconfig; \
     aria2c --version; \
    aria2c --version | grep -F "aria2 version ${ARIA2_VERSION}" || echo "WARNING: version mismatch"; \
@@ -340,6 +343,7 @@ RUN set -eux; \
         --enable-shared \
         --disable-static \
         --disable-doc \
+        --disable-debug \
         --enable-pic \
         --enable-libaom \
         --enable-libdav1d \

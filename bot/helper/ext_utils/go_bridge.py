@@ -1,14 +1,15 @@
-from asyncio import CancelledError, create_task, gather, sleep
-from base64 import b64encode
-from contextlib import contextmanager
+from asyncio import CancelledError, create_task, gather, sleep, wait_for
+from base64 import b64decode, b64encode
+from contextlib import AsyncExitStack, contextmanager, suppress
 from json import loads
 from os import getenv
 from pathlib import Path
 from struct import error as StructError
 from time import monotonic
+from uuid import uuid4
 
 from httpx import AsyncClient, AsyncHTTPTransport, ConnectError, ConnectTimeout, HTTPError, Timeout
-from pyrogram.raw.types import InputFileBig
+from pyrogram.raw.types import InputFile, InputFileBig
 from pyrogram.file_id import FileId, FileType
 
 
@@ -71,9 +72,23 @@ async def cancel_hoster(uploader):
 
 def bot_auth(client):
     token = getattr(client, "bot_token", None)
-    if not token or getattr(client, "proxy", None):
+    if not token:
         return None
-    return {"app_id": client.api_id, "app_hash": client.api_hash, "token": token}
+    auth = {"app_id": client.api_id, "app_hash": client.api_hash, "token": token}
+    if proxy := getattr(client, "proxy", None):
+        if not isinstance(proxy, dict) or str(proxy.get("scheme", "")).lower() not in {"socks5", "socks5h"}:
+            return None
+        try:
+            host, port = proxy["hostname"], int(proxy["port"])
+        except (KeyError, ValueError, TypeError):
+            return None
+        if not isinstance(host, str) or not host or not 0 < port <= 65535:
+            return None
+        auth["proxy"] = {
+            "scheme": "socks5", "host": host, "port": port,
+            "username": proxy.get("username") or "", "password": proxy.get("password") or "",
+        }
+    return auth
 
 
 def media_request(client, file_id, size, start, end):
@@ -104,6 +119,62 @@ def go_client(read_timeout=15):
         base_url="http://amaterasu-go",
         timeout=Timeout(read_timeout, connect=1),
     )
+
+
+async def register_go_tokens(config, *, stream=None, health=False):
+    if not getenv("AMATERASU_GO_SOCKET"):
+        return False
+    from bot.core.tg_client import TgClient
+
+    helper_tokens = config.helper_bot_tokens()
+    proxies = TgClient._parse_proxies(config.HELPER_BOT_PROXIES)
+    proxied = {token for token, proxy in zip(helper_tokens, proxies) if proxy}
+    tokens = [] if config.TG_PROXY else [
+        token for token in dict.fromkeys([
+            config.BOT_TOKEN, *helper_tokens, *config.stream_bot_tokens(),
+        ]) if token and token not in proxied
+    ]
+    try:
+        async with go_client(2) as sidecar:
+            if health:
+                (await sidecar.get("/v1/health")).raise_for_status()
+            result = await sidecar.post("/v1/mtproto/register-tokens", json={
+                "app_id": config.TELEGRAM_API, "app_hash": config.TELEGRAM_HASH,
+                "tokens": tokens, "stream": stream,
+            })
+            return result.status_code == 204
+    except HTTPError:
+        return False
+
+
+async def publish_go_metadata(client, chat_id, message_id, media, filename, mime_type=None):
+    if not getenv("AMATERASU_GO_SOCKET") or client is None or media is None:
+        return
+    from pymongo.errors import PyMongoError
+    from bot.helper.ext_utils.db_handler import database
+
+    size = getattr(media, "file_size", 0) or 0
+    if size <= 0 or not getattr(media, "file_id", None) or database.db is None:
+        return
+    try:
+        payload = media_request(client, media.file_id, size, 0, size - 1)
+        if payload is None or "proxy" in payload:
+            return
+        bot_id = payload.pop("token").split(":", 1)[0]
+        del payload["app_id"], payload["app_hash"], payload["start"], payload["end"]
+        payload["file_reference"] = b64decode(payload["file_reference"])
+        await wait_for(database.filetolink_collection("streams").update_one(
+            {"_id": f"{int(chat_id)}:{int(message_id)}"},
+            {"$set": {
+                "bot_id": bot_id, "media": payload, "filename": str(filename),
+                "mime_type": mime_type or getattr(media, "mime_type", None) or "application/octet-stream",
+                "unique_id": getattr(media, "file_unique_id", "") or "",
+            }},
+            upsert=True,
+        ), timeout=2)
+    except (RuntimeError, PyMongoError, OSError, ValueError, StructError):
+        # Python FileToLink can still serve an authorized link when Mongo is unavailable.
+        return
 
 
 async def stream_range(client, file_id, size, start, end):
@@ -161,28 +232,51 @@ async def recover_go_range(source, first, start, end, resume, on_failure):
 
 
 async def run_task(task, payload, progress, *, nonrepeatable=False):
+    task_id = uuid4().hex
+    task_path = f"/v1/tasks/{task_id}"
+    accepted = False
     try:
         async with go_client(3600 if nonrepeatable else 30) as sidecar:
-            async with sidecar.stream("POST", f"/v1/tasks/{task}", json=payload) as response:
-                if response.status_code != 200:
-                    if not nonrepeatable or response.status_code in {400, 404}:
-                        return None
-                else:
-                    async for line in response.aiter_lines():
-                        if not line.startswith("data: "):
-                            continue
-                        event = loads(line[6:])
-                        status = event.get("status")
-                        if status == "running":
-                            await progress(event["processed_bytes"], event["total_bytes"])
-                        elif status == "complete":
-                            return event["result"]
-                        elif status == "cooldown":
-                            raise GoFloodWait(event["retry_after"], event["source"])
-                        elif status == "failed":
-                            break
+            try:
+                async with AsyncExitStack() as connection:
+                    response = await connection.enter_async_context(sidecar.stream(
+                        "POST", f"/v1/tasks/{task}", json=payload,
+                        headers={"Accept": "application/json", "X-Amaterasu-Task-ID": task_id},
+                    ))
+                    if response.status_code == 202:
+                        accepted = True
+                        await response.aread()
+                        if response.json().get("id") != task_id:
+                            raise ValueError("unexpected task ID")
+                        response = await connection.enter_async_context(
+                            sidecar.stream("GET", f"{task_path}/events"),
+                        )
+                    if response.status_code != 200:
+                        if not nonrepeatable or (not accepted and response.status_code in {400, 404}):
+                            return None
+                    else:
+                        async for line in response.aiter_lines():
+                            if not line.startswith("data: "):
+                                continue
+                            event = loads(line[6:])
+                            status = event.get("status")
+                            if status == "running":
+                                await progress(event["processed_bytes"], event["total_bytes"])
+                            elif status == "complete":
+                                return event["result"]
+                            elif status == "cooldown":
+                                raise GoFloodWait(event["retry_after"], event["source"])
+                            elif status == "rejected":
+                                return None
+                            elif status == "failed":
+                                break
+            finally:
+                if accepted:
+                    with suppress(HTTPError):
+                        await sidecar.delete(task_path, timeout=3)
     except (ConnectError, ConnectTimeout):
-        return None
+        if not accepted or not nonrepeatable:
+            return None
     except (HTTPError, OSError, ValueError, KeyError):
         if nonrepeatable:
             raise HostUploadUncertain("Go hoster upload outcome is unknown") from None
@@ -199,7 +293,7 @@ async def upload_parts(client, filename, progress):
         return None
     path = Path(filename).absolute()
     try:
-        if not path.is_file() or not 10 * 1024**2 < path.stat().st_size <= 2 * 1024**3:
+        if not path.is_file() or not 0 < path.stat().st_size <= 2 * 1024**3:
             return None
     except OSError:
         return None
@@ -209,7 +303,10 @@ async def upload_parts(client, filename, progress):
         record_go_flood(client, wait.seconds)
         return None
     if result is not None:
-        return InputFileBig(id=result["id"], parts=result["parts"], name=result["name"])
+        fields = {key: result[key] for key in ("id", "parts", "name")}
+        if "md5_checksum" in result:
+            return InputFile(**fields, md5_checksum=result["md5_checksum"])
+        return InputFileBig(**fields)
     return None
 
 

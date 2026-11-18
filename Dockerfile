@@ -1,4 +1,16 @@
 ARG BASE_IMAGE=docker.io/nbots/amaterasu:v1
+
+# ── Web UI build stage ────────────────────────────────────────────────
+# The web pages are Svelte apps sharing one design system (web/ui). This
+# stage builds them to web/static/dist; only the built files reach the
+# runtime image, so the final image carries no Node toolchain.
+FROM docker.io/library/node:24-bookworm-slim AS web-ui
+WORKDIR /src/web/ui
+COPY web/ui/package.json web/ui/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY web/ui/ ./
+RUN npm run build
+
 FROM ${BASE_IMAGE}
 
 ENV LANG=C.UTF-8 \
@@ -42,10 +54,12 @@ RUN /amaterasuvenv/bin/pip install --no-cache-dir uv
 # Install python dependencies using uv
 COPY requirements.txt .
 RUN /amaterasuvenv/bin/uv pip install --python /amaterasuvenv/bin/python --no-cache-dir -r requirements.txt \
-    && /amaterasuvenv/bin/python -c "from importlib.metadata import version; import pyrogram, warpcrypto; from pyrogram.crypto import aes; assert pyrogram.__version__ == '3.1.5', pyrogram.__version__; assert version('warpcrypto') == '2.0.8', version('warpcrypto'); assert getattr(aes, 'warpcrypto', None) is warpcrypto, 'WarpCrypto is not WZGram active crypto backend'; print('Verified WZGram 3.1.5 with active WarpCrypto 2.0.8 backend')"
+    && /amaterasuvenv/bin/python -c "from importlib.metadata import version; import pyrogram, warpcrypto; from pyrogram.crypto import aes; assert pyrogram.__version__ == '3.1.7', pyrogram.__version__; assert version('warpcrypto') == '2.0.8', version('warpcrypto'); assert getattr(aes, 'warpcrypto', None) is warpcrypto, 'WarpCrypto is not WZGram active crypto backend'; print('Verified WZGram 3.1.7 with active WarpCrypto 2.0.8 backend')"
 
 # Copy all the project files
 COPY . .
+# Built web UI (hashed assets + .vite/manifest.json read by web/wserver.py)
+COPY --from=web-ui /src/web/static/dist ./web/static/dist
 
 # Setup permissions and convert Windows line endings to Unix just in case
 RUN sed -i 's/\r$//' *.sh \

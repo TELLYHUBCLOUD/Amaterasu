@@ -765,6 +765,9 @@ class Mirror(TaskListener):
 
         self._set_mode_engine()
         if not await self.resolve_merge_encode_profile():
+            # Leave the shared folder so sibling merge tasks do not wait forever.
+            await self.remove_from_same_dir("Merge encode profile was not resolved.")
+            await delete_links(self.message)
             return
         await self.prepare_merge_plan()
         await self.send_processing()

@@ -35,7 +35,7 @@ from .status_utils import time_to_seconds
 def get_md5_hash(up_path):
     md5_hash = md5()
     with open(up_path, "rb") as f:
-        for byte_block in iter(lambda: f.read(4096), b""):
+        for byte_block in iter(lambda: f.read(1024 * 1024), b""):
             md5_hash.update(byte_block)
         return md5_hash.hexdigest()
 
@@ -1424,7 +1424,8 @@ class FFMpeg:
                             f"{', '.join(sorted(self._progress_keys))}; "
                             f"duration={self._total_time}; frames={self._total_frames}"
                         )
-            await sleep(0.05)
+            # No per-line sleep: ffmpeg emits ~12 lines per 0.5s progress
+            # block, and a slower reader lets the pipe fill and stalls ffmpeg.
 
     async def ffmpeg_cmds(self, ffmpeg, f_path):
         self.clear()

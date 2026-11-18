@@ -748,6 +748,15 @@ async def update_status_message(sid, force=False):
                         f"Status with id: {sid} haven't been updated. Error: {message}"
                     )
                 return
+            # edit_message may replace a text status with a new photo message
+            # (and delete the old one). Track the replacement; otherwise every
+            # tick would edit the deleted message and post yet another photo.
+            if (
+                message is not None
+                and getattr(message, "id", None) is not None
+                and message.id != status_dict[sid]["message"].id
+            ):
+                status_dict[sid]["message"] = message
             status_dict[sid]["message"].text = text
             status_dict[sid]["time"] = time()
 

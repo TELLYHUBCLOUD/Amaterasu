@@ -1,11 +1,12 @@
 from asyncio import gather, sleep, Event, wait_for
 from copy import deepcopy
+from functools import wraps
 from html import escape
 from time import time
 from mimetypes import guess_type
 from contextlib import suppress
 from os import path as ospath, walk
-from re import search as re_search
+from re import escape as re_escape, search as re_search
 from secrets import token_urlsafe
 from tempfile import mkdtemp
 from pyrogram.enums import ButtonStyle
@@ -124,18 +125,24 @@ class TaskListener(TaskConfig):
         self.progress = True
 
     async def remove_from_same_dir(self, error=None):
+        orphaned_stage = None
         async with task_dict_lock:
             if (
                 self.folder_name
                 and self.same_dir
                 and self.mid in self.same_dir[self.folder_name]["tasks"]
             ):
+                shared = self.same_dir[self.folder_name]
                 if self.is_merge:
-                    shared = self.same_dir[self.folder_name]
                     if not shared.get("error"):
                         shared["error"] = str(error or "One merge input did not complete.")
-                self.same_dir[self.folder_name]["tasks"].remove(self.mid)
-                self.same_dir[self.folder_name]["total"] -= 1
+                shared["tasks"].remove(self.mid)
+                shared["total"] -= 1
+                # No task is left to collect staged sibling data.
+                if not shared["tasks"] and shared["total"] <= 0:
+                    orphaned_stage = shared.pop("stage_dir", None)
+        if orphaned_stage:
+            await clean_download(orphaned_stage)
 
     async def send_processing(self):
         if self.processing_msg is not None or self.multi > 1:
@@ -212,12 +219,13 @@ class TaskListener(TaskConfig):
             return
         data = query.data.split()
         await query.answer()
-        if data[2] == "cancel":
+        if data[3] == "cancel":
             self.encode_profile = None
             self.is_cancelled = True
+            self._encode_prompt_cancelled = True
             self.encode_event.set()
-        elif data[2] == "sel":
-            pid = data[3]
+        elif data[3] == "sel":
+            pid = data[4]
             if pid == "default":
                 self.encode_profile = Config.DEFAULT_ENCODE_PRESET
             else:
@@ -243,9 +251,12 @@ class TaskListener(TaskConfig):
             "libx265": "HEVC",
             "libvpx-vp9": "VP9",
         }.get(default_codec, default_codec.upper())
+        # A per-prompt tag keeps concurrent prompts for one user apart:
+        # Pyrogram runs only the first matching handler in a group.
+        prompt_tag = f"enc {self.user_id} {token_urlsafe(3)}"
         buttons = ButtonMaker()
         buttons.data_button(
-            f"◆ DEFAULT : {default_codec}", f"enc {self.user_id} sel default"
+            f"◆ DEFAULT : {default_codec}", f"{prompt_tag} sel default"
         )
 
         for pid, pdata in profiles.items():
@@ -254,9 +265,9 @@ class TaskListener(TaskConfig):
             name = str(pdata.get("name") or pid)
             if pdata.get("is_default"):
                 name = f"⭐ {name}"
-            buttons.data_button(name, f"enc {self.user_id} sel {pid}")
+            buttons.data_button(name, f"{prompt_tag} sel {pid}")
 
-        buttons.data_button("✕ CANCEL", f"enc {self.user_id} cancel")
+        buttons.data_button("✕ CANCEL", f"{prompt_tag} cancel")
         reply_to = await send_message(
             self.message,
             "<b>✦ ENCODING PROFILE</b>\n"
@@ -269,7 +280,7 @@ class TaskListener(TaskConfig):
         self.encode_profile = None
 
         handler = self.client.add_handler(
-            CallbackQueryHandler(self._profile_callback_cb, filters=regex(f"^enc {self.user_id}")),
+            CallbackQueryHandler(self._profile_callback_cb, filters=regex(f"^{re_escape(prompt_tag)} ")),
             group=-1,
         )
         try:
@@ -316,8 +327,13 @@ class TaskListener(TaskConfig):
                         break
 
         if not self.encode_profile:
+            self._encode_prompt_cancelled = False
             await self._prompt_encode_profile()
 
+        if getattr(self, "_encode_prompt_cancelled", False):
+            # Nothing else cleans up a task cancelled from this prompt.
+            await self.on_download_error("Encoding cancelled by user.")
+            return None
         if self.is_cancelled or not self.encode_profile:
             return None
 
@@ -453,24 +469,36 @@ class TaskListener(TaskConfig):
                             self.same_dir[self.folder_name]["total"] <= 1
                             or len(self.same_dir[self.folder_name]["tasks"]) > 1
                         ):
-                            if self.same_dir[self.folder_name]["total"] > 1:
-                                self.same_dir[self.folder_name]["tasks"].remove(
-                                    self.mid
-                                )
-                                self.same_dir[self.folder_name]["total"] -= 1
+                            shared = self.same_dir[self.folder_name]
+                            if shared["total"] > 1:
+                                shared["tasks"].remove(self.mid)
+                                shared["total"] -= 1
                                 spath = f"{self.dir}{self.folder_name}"
-                                des_id = list(self.same_dir[self.folder_name]["tasks"])[
-                                    0
-                                ]
-                                des_path = f"{DOWNLOAD_DIR}{des_id}{self.folder_name}"
-                                LOGGER.info(f"Moving files from {self.mid} to {des_id}")
+                                # Stage finished sibling data in a group-owned
+                                # directory instead of another live task's dir,
+                                # so a later failure of that task cannot delete it.
+                                stage = shared.setdefault(
+                                    "stage_dir", f"{DOWNLOAD_DIR}.same-dir-{self.mid}"
+                                )
+                                des_path = f"{stage}{self.folder_name}"
+                                LOGGER.info(f"Moving files from {self.mid} to {stage}")
                                 await move_and_merge(spath, des_path, self.mid)
                                 multi_links = True
-                            elif self.is_merge:
-                                shared = self.same_dir[self.folder_name]
-                                if shared.get("merge_finalizer_claimed"):
-                                    return
-                                shared["merge_finalizer_claimed"] = self.mid
+                            else:
+                                if self.is_merge:
+                                    if shared.get("merge_finalizer_claimed"):
+                                        return
+                                    shared["merge_finalizer_claimed"] = self.mid
+                                if stage := shared.pop("stage_dir", None):
+                                    staged = f"{stage}{self.folder_name}"
+                                    if await aiopath.exists(staged):
+                                        LOGGER.info(f"Collecting staged files into {self.mid}")
+                                        await move_and_merge(
+                                            staged,
+                                            f"{self.dir}{self.folder_name}",
+                                            "staged",
+                                        )
+                                    await clean_download(stage)
                             break
                     await sleep(1)
         async with task_dict_lock:
@@ -1392,7 +1420,9 @@ class TaskListener(TaskConfig):
 
         await start_from_queued()
         await sleep(3)
-        if not self.is_merge and not preserve_download:
+        # Sibling data is staged outside self.dir, so this only removes
+        # this task's own files (merge sources included).
+        if not preserve_download:
             await clean_download(self.dir)
             if self.up_dir:
                 await clean_download(self.up_dir)
@@ -1475,10 +1505,34 @@ class TaskListener(TaskConfig):
 
         await start_from_queued()
         await sleep(3)
-        if not self.is_merge or merge_staged:
-            await clean_download(self.dir)
+        await clean_download(self.dir)
         if self.up_dir:
             await clean_download(self.up_dir)
         if self.thumb and await aiopath.exists(self.thumb):
             await remove(self.thumb)
 
+
+def _report_processing_errors(on_download_complete):
+    @wraps(on_download_complete)
+    async def guarded(self):
+        try:
+            await on_download_complete(self)
+        except Exception as error:
+            LOGGER.error(
+                f"Post-download processing failed for {self.name}: {error}",
+                exc_info=True,
+            )
+            # Error handlers drop the task_dict entry, so a task still listed
+            # here was not reported yet and would otherwise hang in /status.
+            async with task_dict_lock:
+                pending = self.mid in task_dict
+            if pending and not self.is_cancelled:
+                await self.on_download_error(f"Processing failed: {error}")
+
+    return guarded
+
+
+# Applied outside the class body so tests can still exec the raw method.
+TaskListener.on_download_complete = _report_processing_errors(
+    TaskListener.on_download_complete
+)

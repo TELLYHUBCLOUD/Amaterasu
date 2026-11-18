@@ -1,410 +1,29 @@
 package main
 
 import (
+	"amaterasu/go-engine/internal/config"
+	"amaterasu/go-engine/internal/ipc"
+	"amaterasu/go-engine/internal/mtproto"
+	"amaterasu/go-engine/internal/stream206"
+	"amaterasu/go-engine/internal/uphoster"
 	"context"
 	"encoding/json"
 	"errors"
 	"flag"
-	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
-	"runtime"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
-
-	"github.com/gotd/td/session"
-	"github.com/gotd/td/telegram"
-	"github.com/gotd/td/tg"
-	"github.com/gotd/td/tgerr"
 )
-
-const chunkSize = 1024 * 1024
-
-type credentials struct {
-	AppID   int    `json:"app_id"`
-	AppHash string `json:"app_hash"`
-	Token   string `json:"token"`
-}
-
-type worker struct {
-	client     *telegram.Client
-	stop       context.CancelFunc
-	ready      chan struct{}
-	done       chan struct{}
-	slots      chan struct{}
-	poolMu     sync.Mutex
-	pools      map[int]telegram.CloseInvoker
-	floodUntil atomic.Int64
-	lastUsed   atomic.Int64
-	active     atomic.Int64
-}
-
-type engine struct {
-	ctx     context.Context
-	started time.Time
-	mu      sync.Mutex
-	workers map[credentials]*worker
-}
-
-func (w *worker) release() {
-	w.lastUsed.Store(time.Now().UnixNano())
-	w.active.Add(-1)
-}
-
-func (w *worker) mediaClient(ctx context.Context, dc int) (*tg.Client, error) {
-	w.poolMu.Lock()
-	defer w.poolMu.Unlock()
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	select {
-	case <-w.done:
-		return nil, errors.New("Telegram worker stopped")
-	default:
-	}
-	invoker := w.pools[dc]
-	if invoker == nil {
-		var err error
-		if dc == w.client.Config().ThisDC {
-			invoker, err = w.client.Pool(4)
-		} else {
-			invoker, err = w.client.DC(ctx, dc, 4)
-		}
-		if err != nil {
-			return nil, w.recordFlood(err)
-		}
-		w.pools[dc] = invoker
-	}
-	return tg.NewClient(invoker), nil
-}
-
-func (e *engine) getWorker(ctx context.Context, auth credentials) (*worker, error) {
-	e.mu.Lock()
-	w := e.workers[auth]
-	if w == nil {
-		if len(e.workers) >= 32 {
-			var oldest *worker
-			var key credentials
-			for candidate, cached := range e.workers {
-				if cached.active.Load() == 0 && (oldest == nil || cached.lastUsed.Load() < oldest.lastUsed.Load()) {
-					key, oldest = candidate, cached
-				}
-			}
-			if oldest == nil {
-				e.mu.Unlock()
-				return nil, errors.New("account limit")
-			}
-			delete(e.workers, key)
-			oldest.stop()
-		}
-		workerContext, stop := context.WithCancel(e.ctx)
-		w = &worker{
-			client: telegram.NewClient(auth.AppID, auth.AppHash, telegram.Options{
-				NoUpdates: true, SessionStorage: &session.StorageMemory{},
-			}),
-			stop: stop, ready: make(chan struct{}), done: make(chan struct{}), slots: make(chan struct{}, 8),
-			pools: make(map[int]telegram.CloseInvoker),
-		}
-		e.workers[auth] = w
-		go func() {
-			defer stop()
-			_ = w.client.Run(workerContext, func(ctx context.Context) error {
-				authCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-				defer cancel()
-				if _, err := w.client.Auth().Bot(authCtx, auth.Token); err != nil {
-					return err
-				}
-				close(w.ready)
-				<-ctx.Done()
-				return ctx.Err()
-			})
-			close(w.done)
-			w.poolMu.Lock()
-			for _, pool := range w.pools {
-				_ = pool.Close()
-			}
-			w.poolMu.Unlock()
-			e.mu.Lock()
-			if e.workers[auth] == w {
-				delete(e.workers, auth)
-			}
-			e.mu.Unlock()
-		}()
-	}
-	w.active.Add(1)
-	e.mu.Unlock()
-	select {
-	case <-ctx.Done():
-		w.release()
-		return nil, ctx.Err()
-	case <-w.done:
-		w.release()
-		return nil, errors.New("Telegram worker stopped")
-	case <-w.ready:
-		return w, nil
-	}
-}
-
-func (e *engine) health(w http.ResponseWriter, _ *http.Request) {
-	ready := 0
-	e.mu.Lock()
-	for _, worker := range e.workers {
-		select {
-		case <-worker.ready:
-			ready++
-		default:
-		}
-	}
-	e.mu.Unlock()
-	var memory runtime.MemStats
-	runtime.ReadMemStats(&memory)
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"uptime_seconds": time.Since(e.started).Seconds(),
-		"goroutines":     runtime.NumGoroutine(), "heap_bytes": memory.HeapAlloc, "ready_workers": ready,
-	})
-}
-
-type mediaRange struct {
-	credentials
-	DC        int    `json:"dc"`
-	Kind      string `json:"kind"`
-	ID        int64  `json:"id"`
-	Hash      int64  `json:"access_hash"`
-	Reference []byte `json:"file_reference"`
-	Thumb     string `json:"thumb_size"`
-	Size      int64  `json:"size"`
-	Start     int64  `json:"start"`
-	End       int64  `json:"end"`
-}
-
-func (m mediaRange) valid() bool {
-	return m.AppID > 0 && m.AppHash != "" && m.Token != "" && m.ID != 0 &&
-		m.DC > 0 && m.DC < 10 && (m.Kind == "photo" || m.Kind == "document") &&
-		m.Size > 0 && m.Start >= 0 && m.End >= m.Start && m.End < m.Size
-}
-
-func (m mediaRange) location() tg.InputFileLocationClass {
-	if m.Kind == "photo" {
-		return &tg.InputPhotoFileLocation{ID: m.ID, AccessHash: m.Hash, FileReference: m.Reference, ThumbSize: m.Thumb}
-	}
-	return &tg.InputDocumentFileLocation{ID: m.ID, AccessHash: m.Hash, FileReference: m.Reference, ThumbSize: m.Thumb}
-}
-
-type floodError struct {
-	until  time.Time
-	source int
-}
-
-func (e *floodError) Error() string { return "Telegram cooldown" }
-
-func (e *floodError) seconds() int64 {
-	return max(1, int64((time.Until(e.until)+time.Second-1)/time.Second))
-}
-
-func (w *worker) cooldown() *floodError {
-	until := time.Unix(0, w.floodUntil.Load())
-	if until.After(time.Now()) {
-		return &floodError{until: until, source: -1}
-	}
-	return nil
-}
-
-func (w *worker) recordFlood(err error) error {
-	wait, ok := tgerr.AsFloodWait(err)
-	if !ok {
-		return err
-	}
-	until := time.Now().Add(wait + time.Second)
-	for previous := w.floodUntil.Load(); until.UnixNano() > previous; previous = w.floodUntil.Load() {
-		if w.floodUntil.CompareAndSwap(previous, until.UnixNano()) {
-			break
-		}
-	}
-	return &floodError{until: time.Unix(0, w.floodUntil.Load()), source: -1}
-}
-
-func (e *engine) cooldown(w http.ResponseWriter, r *http.Request) {
-	var auth credentials
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16*1024)).Decode(&auth); err != nil {
-		http.Error(w, "invalid credentials", http.StatusBadRequest)
-		return
-	}
-	e.mu.Lock()
-	worker := e.workers[auth]
-	e.mu.Unlock()
-	if worker != nil {
-		if wait := worker.cooldown(); wait != nil {
-			w.Header().Set("Retry-After", strconv.FormatInt(wait.seconds(), 10))
-			w.WriteHeader(http.StatusTooManyRequests)
-			return
-		}
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func (w *worker) fetch(ctx context.Context, rpc *tg.Client, location tg.InputFileLocationClass, offset int64) ([]byte, error) {
-	if wait := w.cooldown(); wait != nil {
-		return nil, wait
-	}
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	select {
-	case w.slots <- struct{}{}:
-		defer func() { <-w.slots }()
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-	if wait := w.cooldown(); wait != nil {
-		return nil, wait
-	}
-	result, err := rpc.UploadGetFile(ctx, &tg.UploadGetFileRequest{Location: location, Offset: offset, Limit: chunkSize})
-	if err != nil {
-		return nil, w.recordFlood(err)
-	}
-	file, ok := result.(*tg.UploadFile)
-	if !ok {
-		return nil, errors.New("unsupported Telegram download response")
-	}
-	return file.Bytes, nil
-}
-
-type chunkResult struct {
-	data []byte
-	err  error
-}
-
-func rangeChunks(ctx context.Context, start, end int64, fetch func(context.Context, int64) ([]byte, error)) <-chan chunkResult {
-	results := make(chan chunkResult, 1)
-	go func() {
-		defer close(results)
-		ctx, cancel := context.WithCancel(ctx)
-		defer cancel()
-		const window = 4
-		var pending [window]chan chunkResult
-		last := end / chunkSize
-		next := start / chunkSize
-		for current := next; current <= last; current++ {
-			for next <= last && next-current < window {
-				ready := make(chan chunkResult, 1)
-				pending[next%window] = ready
-				offset := next * chunkSize
-				go func() {
-					data, err := fetch(ctx, offset)
-					limit := min(int64(chunkSize), end-offset+1)
-					if err == nil {
-						if int64(len(data)) < limit {
-							err = io.ErrUnexpectedEOF
-						} else {
-							data = data[max(0, start-offset):limit]
-						}
-					}
-					ready <- chunkResult{data: data, err: err}
-				}()
-				next++
-			}
-			var result chunkResult
-			select {
-			case result = <-pending[current%window]:
-			case <-ctx.Done():
-				return
-			}
-			select {
-			case results <- result:
-			case <-ctx.Done():
-				return
-			}
-			if result.err != nil {
-				return
-			}
-		}
-	}()
-	return results
-}
-
-func (e *engine) stream(response http.ResponseWriter, request *http.Request) {
-	var media mediaRange
-	body := http.MaxBytesReader(response, request.Body, 16*1024)
-	if err := json.NewDecoder(body).Decode(&media); err != nil || !media.valid() {
-		http.Error(response, "invalid range request", http.StatusBadRequest)
-		return
-	}
-	ctx, cancel := context.WithCancel(request.Context())
-	defer cancel()
-	setup, stopSetup := context.WithTimeout(ctx, 12*time.Second)
-	defer stopSetup()
-	w, err := e.getWorker(setup, media.credentials)
-	if err != nil {
-		http.Error(response, "Telegram worker unavailable", http.StatusServiceUnavailable)
-		return
-	}
-	defer w.release()
-	if wait := w.cooldown(); wait != nil {
-		rangeError(response, wait)
-		return
-	}
-	rpc, err := w.mediaClient(setup, media.DC)
-	if err != nil {
-		rangeError(response, err)
-		return
-	}
-	location := media.location()
-	serveRange(response, ctx, media, func(ctx context.Context, offset int64) ([]byte, error) {
-		return w.fetch(ctx, rpc, location, offset)
-	})
-}
-
-func rangeError(w http.ResponseWriter, err error) {
-	var wait *floodError
-	if errors.As(err, &wait) {
-		w.Header().Set("Retry-After", strconv.FormatInt(wait.seconds(), 10))
-		http.Error(w, "Telegram cooldown", http.StatusTooManyRequests)
-		return
-	}
-	http.Error(w, "Telegram range unavailable", http.StatusBadGateway)
-}
-
-func serveRange(response http.ResponseWriter, ctx context.Context, media mediaRange, fetch func(context.Context, int64) ([]byte, error)) {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	chunks := rangeChunks(ctx, media.Start, media.End, fetch)
-	first, ok := <-chunks
-	if !ok || first.err != nil {
-		rangeError(response, first.err)
-		return
-	}
-	response.Header().Set("Accept-Ranges", "bytes")
-	response.Header().Set("Content-Type", "application/octet-stream")
-	response.Header().Set("Content-Length", strconv.FormatInt(media.End-media.Start+1, 10))
-	response.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", media.Start, media.End, media.Size))
-	response.WriteHeader(http.StatusPartialContent)
-	controller := http.NewResponseController(response)
-	for chunk := first; ; {
-		if chunk.err != nil {
-			panic(http.ErrAbortHandler)
-		}
-		if _, err := response.Write(chunk.data); err != nil {
-			return
-		}
-		if err := controller.Flush(); err != nil {
-			return
-		}
-		chunk, ok = <-chunks
-		if !ok {
-			return
-		}
-	}
-}
 
 func main() {
 	path := flag.String("sock", "/tmp/amaterasu_go.sock", "private Unix domain socket")
+	streamPort := flag.Int("stream-port", 8081, "loopback streaming port, or 0 to disable")
 	flag.Parse()
 	listener, err := net.Listen("unix", *path)
 	if err != nil {
@@ -417,14 +36,53 @@ func main() {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	e := engine{ctx: ctx, started: time.Now(), workers: make(map[credentials]*worker)}
+	e := mtproto.New(ctx)
+	stream := stream206.New(e)
+	streamServer := &http.Server{Handler: stream, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 16 * 1024}
+	var streamMu sync.Mutex
+	var streamListener net.Listener
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/health", e.health)
-	mux.HandleFunc("POST /v1/stream", e.stream)
-	mux.HandleFunc("POST /v1/cooldown", e.cooldown)
-	mux.HandleFunc("POST /v1/tasks/hyperdl", e.download)
-	mux.HandleFunc("POST /v1/tasks/hyperul", e.upload)
-	mux.HandleFunc("POST /v1/tasks/uphoster", e.uploadHost)
+	mux.HandleFunc("GET /v1/health", e.Health)
+	mux.HandleFunc("POST /v1/mtproto/register-tokens", func(w http.ResponseWriter, r *http.Request) {
+		var cfg config.Registration
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&cfg); err != nil ||
+			cfg.AppID <= 0 || cfg.AppHash == "" || len(cfg.Tokens) > 64 {
+			http.Error(w, "invalid registration", http.StatusBadRequest)
+			return
+		}
+		if cfg.Stream != nil {
+			streamMu.Lock()
+			defer streamMu.Unlock()
+			if err := stream.Configure(*cfg.Stream); err != nil {
+				http.Error(w, "invalid stream configuration", http.StatusBadRequest)
+				return
+			}
+			if *streamPort == cfg.Stream.PythonPort || *streamPort == cfg.Stream.RclonePort {
+				if streamListener != nil {
+					_ = streamListener.Close()
+					streamListener = nil
+				}
+			} else if *streamPort > 0 && streamListener == nil {
+				tcp, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(*streamPort)))
+				if err != nil {
+					log.Print("Go standalone streaming listener unavailable")
+				} else {
+					streamListener = tcp
+					go func() { _ = streamServer.Serve(tcp) }()
+				}
+			}
+		}
+		e.Register(cfg)
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("POST /v1/stream", e.Stream)
+	mux.HandleFunc("POST /v1/cooldown", e.Cooldown)
+	tasks := ipc.NewTasks(ctx)
+	mux.HandleFunc("POST /v1/tasks/hyperdl", tasks.Submit(e.Download))
+	mux.HandleFunc("POST /v1/tasks/hyperul", tasks.Submit(e.Upload))
+	mux.HandleFunc("POST /v1/tasks/uphoster", tasks.Submit(uphoster.Upload))
+	mux.HandleFunc("GET /v1/tasks/{id}/events", tasks.Events)
+	mux.HandleFunc("DELETE /v1/tasks/{id}", tasks.Cancel)
 	server := http.Server{
 		Handler: mux, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second,
 		BaseContext: func(net.Listener) context.Context { return ctx },
@@ -432,6 +90,7 @@ func main() {
 	go func() {
 		<-ctx.Done()
 		_ = server.Close()
+		_ = streamServer.Close()
 	}()
 	if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Print(err)

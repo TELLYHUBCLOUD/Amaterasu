@@ -5,13 +5,13 @@
 **The Absolute Pinnacle of Telegram Mirroring and Leeching**
 
 <p align="center">
-  <a href="#"><img src="https://img.shields.io/badge/Version-1.6.7-orange?style=for-the-badge&logo=rocket"></a>
+  <a href="#"><img src="https://img.shields.io/badge/Version-1.7.0-orange?style=for-the-badge&logo=rocket"></a>
   <a href="#"><img src="https://img.shields.io/github/repo-size/Zan-getsu/Amaterasu?color=FF4500&label=Size&style=for-the-badge"></a>
   <a href="#"><img src="https://img.shields.io/github/license/Zan-getsu/Amaterasu?style=for-the-badge&color=FF8C00"></a>
   <br>
   <a href="#"><img src="https://img.shields.io/badge/Powered%20By-Python_3.11-blue?style=for-the-badge&logo=python"></a>
   <a href="#"><img src="https://img.shields.io/badge/Deployed_Via-Docker-2496ED?style=for-the-badge&logo=docker"></a>
-  <a href="#"><img src="https://img.shields.io/badge/Framework-WZGram_3.1.5-green?style=for-the-badge&logo=telegram"></a>
+  <a href="#"><img src="https://img.shields.io/badge/Framework-WZGram_3.1.7-green?style=for-the-badge&logo=telegram"></a>
 </p>
 
 [**Telegram Channel**](#) • [**Support Group**](#) • [**Report a Bug**](#)
@@ -191,7 +191,7 @@ graph TD
 | Component | Technology |
 |---|---|
 | Language | Python 3.11 |
-| Telegram Framework | WZGram 3.1.5 (`pyrogram` API) |
+| Telegram Framework | WZGram 3.1.7 (`pyrogram` API) |
 | Web Server | FastAPI + Uvicorn |
 | Database | MongoDB (Motor async driver) |
 | Containerization | Docker / Podman |
@@ -2081,6 +2081,8 @@ Amaterasu includes a built-in FastAPI web server that converts any Telegram file
 For multiple consecutive files, reply to the first file and use `/link -i 10` to generate links for 10 files in one command.
 
 Use `/link status` to check the active `BASE_URL`, stream bot pool, current stream loads, and FileToLink cache usage.
+
+The Go sidecar also serves signed `/stream/` and `/dl/` links on `127.0.0.1:8081`. A local reverse proxy can route those paths to Go and leave the rest of the web UI on Python. Go caches MongoDB media metadata for 15 minutes and falls back to Python when it cannot serve a link directly. The Go listener limits requests by the TCP peer IP, so a reverse proxy should apply its own per-viewer limit. Set `AMATERASU_GO_STREAM_PORT` in the bot process environment to change the port or set it to `0` to disable the listener. When Gunicorn or rclone is configured to use the same port, the Go listener yields it.
 
 The web server serves an existing complete cached file immediately when available. Uncached full-file responses populate the cache as their bytes pass through; there is no second background download. Adaptive streaming also caches chunks fetched within the first 4 MiB and final 2 MiB, including for videos larger than the whole-file cache limit. It reuses complete chunks for the same media identity, file size, offset, and request size. Writes are atomic, and a cache failure falls back to Telegram. No extra head/tail reads are started just to warm the cache.
 

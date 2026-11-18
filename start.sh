@@ -49,7 +49,7 @@ case "${USE_GO_ENGINE,,}" in
     1|true|yes|on)
         if command -v amaterasu-go >/dev/null 2>&1 && socket_dir="$(mktemp -d)"; then
             export AMATERASU_GO_SOCKET="$socket_dir/engine.sock"
-            amaterasu-go --sock "$AMATERASU_GO_SOCKET" &
+            amaterasu-go --sock "$AMATERASU_GO_SOCKET" --stream-port "${AMATERASU_GO_STREAM_PORT:-8081}" &
             go_pid=$!
             python3 -m bot &
             bot_pid=$!
